@@ -40,6 +40,8 @@ class DependencyGraph:
 
         # --- jar 级 mandatory 依赖集(含内嵌 mod 的依赖) ---
         self.warnings: list[str] = []
+        # 结构化缺失依赖: [(jar base_name, 缺失 modid)] — 修补系统的输入(UI 按需消费)
+        self.missing: list[tuple[str, str]] = []
         self.jar_deps: dict[str, frozenset[str]] = {}
         for j in jars:
             needed: set[str] = set()
@@ -56,6 +58,7 @@ class DependencyGraph:
                     continue  # 本 jar 自给自足(含内嵌 mod 提供)
                 if not provs:
                     # 基线即无人提供: 整合包既存状态, 该边不参与传播
+                    self.missing.append((j.base_name, d))  # 交给修补系统
                     self.warnings.append(
                         f"{j.base_name}: 依赖 {d} 目录内无人提供(既存状态, 已忽略该边)")
                     continue
@@ -138,6 +141,8 @@ class DependencyGraph:
                         alive.add(p)
                         frontier.append(p)
         return frozenset(alive)
+
+
 def _tarjan_scc(nodes: list[str],
                 adj: dict[str, set[str]]) -> list[frozenset[str]]:
     """迭代版 Tarjan SCC(避免深递归炸栈, 千级节点安全)。"""

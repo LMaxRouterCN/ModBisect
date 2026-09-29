@@ -44,6 +44,13 @@ class AppConfig:
     # 原 latest.log 文件锁探测方案不可靠(log4j2 共享写持锁),已弃用,见 GOAL-PLAN D3
     fallback_poll_interval_ms: int = 500
 
+    # ---- UI 偏好持久化(config.json 平铺字段, UI 层读写, 程序逻辑不消费) ----
+    # 窗口几何: QMainWindow.saveGeometry() 的 QByteArray -> base64 文本
+    ui_window_geometry: str = ""
+    # mod 表表头状态: 列宽/列序/当前排序列(saveState() -> base64 文本)
+    ui_header_state: str = ""
+    # 上次选择的 mods 目录(启动时预填目录框, 免重复浏览)
+    ui_last_mods_dir: str = ""
     # ---- 依赖图 ----
     # 这些 modid 由加载器/JDK/游戏本体提供,不参与 mods 目录内的依赖传播
     ignore_modids: list[str] = field(default_factory=lambda: [

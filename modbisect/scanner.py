@@ -67,7 +67,7 @@ def scan_mods_dir(mods_dir: str, cfg: AppConfig) -> ScanResult:
     # 阶段一: 枚举原始记录 base_name -> (文件名, 启用态, 字节数)
     suffix = cfg.disabled_suffix
     suffix_low = suffix.lower()
-    records: dict[str, tuple[str, bool, int]] = {}
+    records: dict[str, tuple[str, bool, int, float]] = {}  # base -> (文件名, 启用, size, mtime)
     with os.scandir(mods_dir) as it:
         for entry in it:
             if not entry.is_file():
@@ -85,20 +85,22 @@ def scan_mods_dir(mods_dir: str, cfg: AppConfig) -> ScanResult:
                 prev_name, prev_enabled, _ = records[base]
                 if enabled and not prev_enabled:
                     # 启用副本是磁盘上的活跃文件, 以它为准
-                    records[base] = (name, True, entry.stat().st_size)
+                    st = entry.stat()  # 一次取全(size+mtime; DirEntry 自带 stat 缓存)
+                    records[base] = (name, True, st.st_size, st.st_mtime)
                     result.warnings.append(
                         f"{base}: 启用与禁用副本同时存在, 以启用副本为准")
                 else:
                     result.warnings.append(
                         f"{base}: 重复的禁用副本 {name}, 已忽略")
             else:
-                records[base] = (name, enabled, entry.stat().st_size)
+                st = entry.stat()  # 同上
+                records[base] = (name, enabled, st.st_size, st.st_mtime)
 
     # 阶段二: 逐 jar 解析元数据(按 base_name 排序保证输出确定性)
     for base in sorted(records):
-        filename, enabled, size = records[base]
+        filename, enabled, size, mtime = records[base]
         jar = JarInfo(directory=mods_dir, base_name=base,
-                      enabled=enabled, size=size)
+                      enabled=enabled, size=size, mtime=mtime)
         _parse_jar(jar, cfg, result.warnings)
         result.jars.append(jar)
     return result

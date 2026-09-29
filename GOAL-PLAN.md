@@ -49,6 +49,13 @@
 | modbisect/ui/dialogs.py | 结果弹窗/判决弹窗 |
 | main.py | 入口 |
 
+v0.2 新增外围层(独立模块, 不侵入五层主链):
+- modbisect/sortkey.py     拼音/版本排序键(纯函数)
+- modbisect/snapshots.py   mod 启停状态全集快照(建/列/读/一致性检查/目标集)
+- modbisect/repair.py      缺失依赖修补(文件名反查候选 + mods.toml modId 改写)
+- modbisect/ui/style.py    黑金直角主题(QSS + 语义色常量, 唯一色源)
+- modbisect/ui/panels.py   依赖关系画框(双击行展开)
+
 ## 6. 关键设计决策(已与用户确认)
 - D1 轮次边界 = 游戏进程生命周期,用户手动启动,工具被动观察,不碰启动器
 - D2 启动信号 = watchdog 监听实例根/logs/latest.log 创建/重写(实例根 = mods 父目录)
@@ -68,6 +75,14 @@
 - D8 绑定单元 = 唯一提供者拖拽图的 SCC: 互为强制依赖的 jar 物理上不可分离,二分以单元为粒度
 - D9 每轮 apply 前校验磁盘实际状态 vs 引擎记录,不一致 → 警告重扫
 - D10 会话自动保存 sessions/*.json,可恢复(快照指纹 = 文件名+大小)
+- D11 [v0.2 授权裁量, 醒后确认] 级联启停对称: 双击状态格的级联集 = base + 传递依赖它的;
+  禁用=拖死整条依赖链(与引擎闭包同向), 启用=连带拉起(两方向波及, 字面执行)
+- D12 [v0.2 授权裁量, 醒后确认] 快照恢复: 一致性警告=闸门而非静默排除(指纹不符的 jar
+  用户确认后仍可恢复); 修补 .orig 备份永不覆盖(首次=真原件), 修补失败入忽视表
+  防"重扫→再弹"死循环, 在途串行(完成一次重扫再查下一缺失)
+- D13 [v0.2 授权裁量, 醒后确认] 判决非模态化(右列按钮), JUDGING 态可中止(对等原弹窗
+  "关窗=中止"路径); 主控按钮移驻右列; UI 偏好走 config.json 平铺字段(不碰注册表)
+
 
 ## 7. 二分语义(引擎正确性核心)
 - S = 嫌疑集(不变量: 罪魁 ∈ S)
@@ -98,10 +113,11 @@
 - watchdog 事件时序(NTFS 正常;网络盘/符号链接可能异常)
 - 杀软干扰批量重命名 → 失败重试,幂等
 
-## 11. 测试计划
-- tests/test_engine.py: 纯函数场景(单因收敛/闭包传播/绑定单元/退化报错)
-- tests/test_scanner.py: zipfile 生成假 mods 目录,断言解析结果
-- GUI 冒烟: QT_QPA_PLATFORM=offscreen 窗口构建
+## 11. 测试计划(实际交付形态)
+- tests/test_core.py: 纯模块全链(scanner/depgraph/engine/executor/session
+  + v0.2 sortkey/snapshots/repair/missing, 95 断言)
+- tests/smoke.py: offscreen 无头冒烟, 真实事件链含 v0.2 全新功能(级联/快照/
+  判决非模态/调试直通, 53 断言)
 - 真机: Max 用真实整合包跑一轮
 
 ## 12. 里程碑
@@ -111,9 +127,12 @@
 - [x] M3 executor/watcher/processmon/session
 - [x] M4 ui + main
 - [x] M5 依赖安装 + 测试 + git + LICENSE
+- [x] M6 v0.2 交付: 排序/级联启停/依赖画框/快照/修补/判决非模态/调试直通/
+  黑金主题/UI 偏好持久化
 
 ## 13. 后续迭代(优先级序)
-1. 自由开关+测试记录模式(交互问题逃生门)
+1. 自由开关+测试记录模式(交互问题逃生门)— v0.2 已落地自由开关半边
+   (双击级联启停 + 快照系统); 测试记录模式(记录用户手动开关反推嫌疑)仍未做
 2. 组合搜索(最小复现集上 leave-one-out)
 3. Fabric 支持(fabric.mod.json)
 4. 更聪明的切分启发式(避开枢纽依赖,按闭包影响最小侧切)

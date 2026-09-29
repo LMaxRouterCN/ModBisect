@@ -11,3 +11,6 @@ sessions/
 
 # 一次性补丁脚本(用后即删, 防漏网)
 _patch*.py
+snapshots/
+_t*.py
+_fix*.py

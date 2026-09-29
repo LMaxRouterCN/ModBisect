@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 
 
 @dataclass
@@ -49,6 +50,7 @@ class JarInfo:
     size: int               # 文件字节数(会话恢复时的指纹校验用)
     mods: list[ModInfo] = field(default_factory=list)
     source: str = "unknown" # 元数据来源: mods.toml / neoforge.mods.toml / mcmod.info / unknown
+    mtime: float = 0.0            # 文件最后修改时间戳(st_mtime); 0 = 未知
 
     # ---- 路径计算 ----
     def path(self, enabled: bool, disabled_suffix: str) -> str:
@@ -76,3 +78,10 @@ class JarInfo:
     @property
     def version(self) -> str:
         return self.mods[0].version if self.mods else ""
+
+    @property
+    def mtime_str(self) -> str:
+        """展示用文本(YYYY-MM-DD HH:MM); mtime=0(未知)返回空串。"""
+        if not self.mtime:
+            return ""
+        return datetime.fromtimestamp(self.mtime).strftime("%Y-%m-%d %H:%M")

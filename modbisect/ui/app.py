@@ -2,38 +2,47 @@
 """UI 主窗口: 信号枢纽与状态机调度(全程序唯一有"时间"概念的一层)。
 
 设计要点:
-- UI 线程零阻塞: 扫描/启停/还原/会话恢复全部走 _Worker
+- UI 线程零阻塞: 扫描/启停/还原/会话恢复/快照/修补全部走 _Worker
   (threading 执行 + Qt 信号回投, 跨线程 emit 自动 queued 到 UI 线程)
 - 两层状态机: UiState(外壳调度)与 engine.Phase(纯计算)并存,
   本层只调度不计算, 引擎只计算不调度 —— 计算与调度彻底解耦
 - watcher / processmon 的回调线程只发信号, 所有状态推进都在 UI 线程
 - 会话持久化: 引擎每次状态变化(apply 完成/答案归算)后 save_session
+- v0.2: 表头拼音排序 / 双击级联启停 / 依赖画框 / 快照系统 /
+  修补系统 / 右侧按钮列(判决非模态化) / 调试直通 / UI 偏好持久化
 - 时序边角: apply 期间用户提前启动游戏 → 同样跟踪(不倒回等待提示);
   crash 事件晚于游戏退出到达 → JUDGING 状态仍计入本轮崩溃标志
 """
 
 from __future__ import annotations
 
+import os
 import threading
 from enum import Enum
 
+from PySide6.QtCore import QByteArray, QObject, Qt, Signal
 from PySide6.QtGui import QColor
-from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import (QAbstractItemView, QFileDialog, QHBoxLayout,
                                QHeaderView, QInputDialog, QLabel, QLineEdit,
                                QMainWindow, QMessageBox, QPlainTextEdit,
                                QPushButton, QTableWidget, QTableWidgetItem,
                                QVBoxLayout, QWidget)
 
-from ..config import AppConfig
+from ..config import AppConfig, save_config
 from ..depgraph import DependencyGraph
-from ..engine import Action, BisectEngine
+from ..engine import Action, Answer, BisectEngine, Phase
 from ..executor import ApplyReport, Executor
 from ..processmon import ProcessMonitor
+from ..repair import find_candidates, patch_modid
 from ..scanner import ScanResult, scan_mods_dir
 from ..session import RestoreResult, list_sessions, restore_session, save_session
+from ..snapshots import (create_snapshot, list_snapshots, load_snapshot,
+                         snapshot_check, snapshot_target)
+from ..sortkey import name_key, version_key
 from ..watcher import Watcher
-from .dialogs import JudgeDialog, VerdictDialog
+from .dialogs import RepairDialog, SnapshotDialog, VerdictDialog
+from .panels import DepPanel
+from .style import GREEN, ORANGE, TEXT_DIM, YELLOW
 
 
 class UiState(Enum):
@@ -41,10 +50,10 @@ class UiState(Enum):
     IDLE = "idle"                 # 未扫描
     SCANNING = "scanning"         # 扫描/恢复进行中
     READY = "ready"               # 已装配, 可开始或继续
-    APPLYING = "applying"         # 正在把计划 diff 到磁盘(或还原中)
+    APPLYING = "applying"         # 正在把计划 diff 到磁盘(或还原/开关/快照中)
     WAIT_LAUNCH = "wait_launch"   # 已提示, 等用户启动游戏
     WAIT_GAME = "wait_game"       # 游戏运行中(procmon 跟踪)
-    JUDGING = "judging"           # 判决弹窗打开中
+    JUDGING = "judging"           # 等待右列判决按钮作答
     DONE = "done"                 # 终局报告已展示
 
 
@@ -54,7 +63,11 @@ _TESTING_STATES = (UiState.APPLYING, UiState.WAIT_LAUNCH,
 
 
 class _Worker(QObject):
-    """通用后台任务: threading 执行, 结果经 Qt 信号回 UI 线程。"""
+    """通用后台任务: threading 执行, 结果经 Qt 信号回 UI 线程。
+
+    调用方以集合持引用防 GC(v0.2 多任务可并发: 修补在途时快照仍可发起,
+    单引用会被新任务顶掉导致旧 worker 信号断链); 回投后由包装回调自摘。
+    """
 
     done = Signal(object)   # fn(*args) 的返回值
     fail = Signal(str)      # 异常描述
@@ -74,6 +87,22 @@ class _Worker(QObject):
             self.fail.emit(f"{type(e).__name__}: {e}")
 
 
+# 行身份角色: 排序后行号会漂移, 表格项携带 jar base_name 是唯一可靠身份
+_JAR_ROLE = Qt.ItemDataRole.UserRole + 1
+
+
+class _KeyItem(QTableWidgetItem):
+    """带排序键的表格项(需求 1): __lt__ 按 UserRole 键比较, 与显示文本解耦。
+
+    文本排序对版本号("1.10.2" < "1.9.4" 错)与中文名(Unicode 码点序)都不可靠;
+    键在填充时预计算(拼音 / 数字分段 / 复合元组), 点击表头时 Qt 逐对调本方法。
+    """
+
+    def __lt__(self, other) -> bool:
+        return (self.data(Qt.ItemDataRole.UserRole)
+                < other.data(Qt.ItemDataRole.UserRole))
+
+
 class MainWindow(QMainWindow):
     """主窗口: 全事件链的枢纽与唯一调度者。"""
 
@@ -87,22 +116,34 @@ class MainWindow(QMainWindow):
         self._engine: BisectEngine | None = None    # None = 会话未开始
         self._watcher: Watcher | None = None
         self._procmon: ProcessMonitor | None = None
-        self._current_plan = None                   # 本轮计划(弹窗/提示用)
+        self._current_plan = None                   # 本轮计划(提示/判决按钮用)
         self._last_report: ApplyReport | None = None
         self._crash_flag = False                    # 本轮内是否见过崩溃文件
         self._state = UiState.IDLE
-        self._active_worker: _Worker | None = None  # 引用持有, 防 GC 回收
+        self._workers: set[_Worker] = set()         # 在途任务引用(完成自摘)
+
+        # ---- v0.2: 依赖画框 / 级联缓存 / 修补忽视表 ----
+        self._panel: DepPanel | None = None         # 依赖画框(扫描后创建)
+        self._panel_base = ""                       # 画框当前展示的 jar
+        self._rev_adj: dict[str, set[str]] = {}     # 反向邻接(级联直查缓存)
+        self._ignored_missing: set[tuple[str, str]] = set()  # 已忽视缺失(进程级)
 
         self.setWindowTitle("ModBisect — MC 问题 Mod 二分排查")
-        self.resize(960, 640)
+        self.resize(1100, 680)
         self._build_ui()
         self._apply_state()
+        self._restore_ui_prefs()  # UI 偏好: 几何/表头/最后目录(需求 6)
 
     # ---------------------------------------------------------------- UI 构建
 
     def _build_ui(self) -> None:
         central = QWidget()
-        root = QVBoxLayout(central)
+        outer = QHBoxLayout(central)   # v0.2: 左主区 + 右按钮列(需求 7)
+
+        # ---- 左主区(纵向) ----
+        root = QVBoxLayout()
+        outer.addLayout(root, stretch=1)
+        self._root_layout = root  # 依赖画框动态插拔需要(扫描后插到状态行下)
 
         # 行1: 目录选择与扫描
         row1 = QHBoxLayout()
@@ -121,14 +162,8 @@ class MainWindow(QMainWindow):
         row1.addWidget(self._btn_resume)
         root.addLayout(row1)
 
-        # 行2: 会话控制与进度指示
+        # 行2: 进度指示(主控按钮已移驻右列)
         row2 = QHBoxLayout()
-        self._btn_start = QPushButton("开始排查")
-        self._btn_start.clicked.connect(self._on_start)
-        row2.addWidget(self._btn_start)
-        self._btn_abort = QPushButton("中止排查")
-        self._btn_abort.clicked.connect(self._on_abort)
-        row2.addWidget(self._btn_abort)
         row2.addStretch(1)
         self._lbl_round = QLabel("—")
         row2.addWidget(self._lbl_round)
@@ -141,32 +176,92 @@ class MainWindow(QMainWindow):
         root.addWidget(self._lbl_status)
 
         # mod 表格(全量重建, 几百行量级无需差量更新)
-        self._table = QTableWidget(0, 5)
+        # 布局占位: 依赖画框(_ensure_panel)在首次扫描后插入状态行与表格之间
+        self._table = QTableWidget(0, 6)
         self._table.setHorizontalHeaderLabels(
-            ["状态", "名称", "版本", "元数据来源", "嫌疑"])
+            ["状态", "名称", "最后修改", "版本", "元数据来源", "嫌疑"])
         self._table.verticalHeader().setVisible(False)
         self._table.setEditTriggers(
             QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows)
-        self._table.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.Stretch)
+        header = self._table.horizontalHeader()
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionsMovable(True)    # 列序可拖(随 saveState 持久化, 需求 6)
+        header.setSectionsClickable(True)  # 点击表头排序(需求 1)
+        self._table.setSortingEnabled(True)
+        header.setSortIndicator(1, Qt.SortOrder.AscendingOrder)  # 默认名称升序
+        self._table.cellDoubleClicked.connect(self._on_cell_double)  # 需求 3/4
         root.addWidget(self._table, stretch=3)
 
-        # 日志区(只读; 上限防长会话内存增长)
-        # 日志区(只读; 上限防长会话内存增长)。控件名与日志方法刻意区分:
-        # 实例属性赋值会遮蔽同名类方法(self._log=msg 方法), 历史踩坑, 勿合并
+        # 日志区(只读; 上限防长会话内存增长)。
+        # 控件名与日志方法刻意区分: 实例属性赋值会遮蔽同名类方法
+        # (self._log=msg 方法), 历史踩坑, 勿合并
         self._log_view = QPlainTextEdit()
         self._log_view.setReadOnly(True)
         self._log_view.setMaximumBlockCount(2000)
         root.addWidget(self._log_view, stretch=1)
+
+        # ---- 右按钮列(需求 7: 动作集中 + 判决非模态化) ----
+        side = QVBoxLayout()
+        side.setSpacing(6)
+        # 会话主控(从行2移驻, 右列 = 全部动作的家)
+        self._btn_start = QPushButton("开始排查")
+        self._btn_start.clicked.connect(self._on_start)
+        self._btn_start.setMinimumHeight(44)
+        side.addWidget(self._btn_start)
+        self._btn_abort = QPushButton("中止排查")
+        self._btn_abort.clicked.connect(self._on_abort)
+        self._btn_abort.setMinimumHeight(36)
+        side.addWidget(self._btn_abort)
+        side.addSpacing(12)
+        # 快照(需求 5)
+        self._btn_snap_new = QPushButton("创建快照")
+        self._btn_snap_new.clicked.connect(self._on_snapshot_create)
+        side.addWidget(self._btn_snap_new)
+        self._btn_snap_restore = QPushButton("恢复快照…")
+        self._btn_snap_restore.clicked.connect(self._on_snapshot_restore)
+        side.addWidget(self._btn_snap_restore)
+        side.addSpacing(12)
+        # 调试直通(需求 10): 免启动游戏直接判决, 测试者专用
+        self._btn_debug = QPushButton("就当我开关过游戏了")
+        self._btn_debug.setToolTip("调试: 跳过真实启动/退出, 直接进入本轮判决")
+        self._btn_debug.clicked.connect(self._on_debug_fake_game)
+        side.addWidget(self._btn_debug)
+        side.addStretch(1)  # 判决组沉底(视觉与"轮次进行"区隔)
+        # 判决组(需求 7: 替代原模态弹窗, 仅 JUDGING 态显示)
+        self._btn_judge_present = QPushButton("问题还在\n(出在当前启用的里)")
+        self._btn_judge_present.setMinimumHeight(52)
+        self._btn_judge_present.clicked.connect(self._on_judge_present)
+        side.addWidget(self._btn_judge_present)
+        self._btn_judge_absent = QPushButton("问题消失了\n(出在刚被禁用的里)")
+        self._btn_judge_absent.setMinimumHeight(52)
+        self._btn_judge_absent.clicked.connect(self._on_judge_absent)
+        side.addWidget(self._btn_judge_absent)
+        self._btn_judge_skip = QPushButton("跳过基准确认\n(我确定 bug 存在)")
+        self._btn_judge_skip.setMinimumHeight(52)
+        self._btn_judge_skip.clicked.connect(self._on_judge_skip)
+        side.addWidget(self._btn_judge_skip)
+        self._btn_judge_retest = QPushButton("重新测试本轮\n(还原本轮再测一次)")
+        self._btn_judge_retest.setMinimumHeight(52)
+        self._btn_judge_retest.clicked.connect(self._on_judge_retest)
+        side.addWidget(self._btn_judge_retest)
+        for b in (self._btn_judge_present, self._btn_judge_absent,
+                  self._btn_judge_skip, self._btn_judge_retest):
+            b.setVisible(False)  # 仅 JUDGING 态显示
+
+        side_w = QWidget()
+        side_w.setLayout(side)
+        side_w.setMinimumWidth(190)
+        side_w.setMaximumWidth(220)
+        outer.addWidget(side_w)
 
         self.setCentralWidget(central)
 
     # ---------------------------------------------------------------- 状态机
 
     def _apply_state(self) -> None:
-        """按 UiState 刷新按钮可用性与文案。"""
+        """按 UiState 刷新按钮可用性/可见性与文案。"""
         s = self._state
         idle_like = (UiState.IDLE, UiState.READY, UiState.DONE)
         self._btn_scan.setEnabled(s in idle_like)
@@ -174,7 +269,21 @@ class MainWindow(QMainWindow):
         self._btn_resume.setEnabled(s in idle_like)
         self._btn_start.setEnabled(s is UiState.READY and self._scan is not None)
         self._btn_abort.setEnabled(
-            s in (UiState.APPLYING, UiState.WAIT_LAUNCH, UiState.WAIT_GAME))
+            s in (UiState.APPLYING, UiState.WAIT_LAUNCH, UiState.WAIT_GAME,
+                  UiState.JUDGING))  # v0.2: JUDGING 也可中止(对等原弹窗关闭路径)
+        # 快照与自由开关: 仅空闲态(防磁盘态与引擎推理脱钩)
+        self._btn_snap_new.setEnabled(s in idle_like and self._scan is not None)
+        self._btn_snap_restore.setEnabled(s in idle_like and self._scan is not None)
+        # 调试直通: 仅等待启动态(WAIT_GAME 走 procmon 真实路径)
+        self._btn_debug.setEnabled(s is UiState.WAIT_LAUNCH)
+        # 判决组: 仅 JUDGING 可见; 跳过按钮再限基准轮(引擎侧另有二次防御)
+        judging = s is UiState.JUDGING
+        for b in (self._btn_judge_present, self._btn_judge_absent,
+                  self._btn_judge_skip, self._btn_judge_retest):
+            b.setVisible(judging)
+        if judging and self._current_plan is not None:
+            self._btn_judge_skip.setVisible(
+                self._current_plan.phase is Phase.BASELINE)
         # 开始按钮文案: 恢复的会话(引擎在场) = 继续; 全新扫描 = 开始
         if s is UiState.READY:
             self._btn_start.setText(
@@ -182,6 +291,8 @@ class MainWindow(QMainWindow):
 
     def _set_state(self, s: UiState, status: str = "") -> None:
         self._state = s
+        # 清崩溃警告着色(该着色仅由 _enter_judging 按需设置)
+        self._lbl_status.setStyleSheet("")
         if status:
             self._lbl_status.setText(status)
         self._apply_state()
@@ -199,38 +310,39 @@ class MainWindow(QMainWindow):
             self._lbl_suspects.setText(
                 f"剩余嫌疑 {self._engine.suspect_count} 单元")
 
-    def _refresh_table(self) -> None:
-        """全量重建表格: 禁用行灰显, 嫌疑行加红点。"""
-        if self._scan is None:
-            self._table.setRowCount(0)
-            return
-        suspects = self._engine.suspects if self._engine else frozenset()
-        jars = sorted(self._scan.jars, key=lambda j: j.base_name.lower())
-        self._table.setRowCount(len(jars))
-        for row, j in enumerate(jars):
-            items = [
-                QTableWidgetItem("启用" if j.enabled else "禁用"),
-                QTableWidgetItem(j.label),
-                QTableWidgetItem(j.version),
-                QTableWidgetItem(j.source),
-                QTableWidgetItem("●" if j.base_name in suspects else ""),
-            ]
-            if not j.enabled:
-                for it in items:  # 禁用行整体灰显
-                    it.setForeground(QColor(128, 128, 128))
-            items[4].setForeground(QColor(211, 47, 47))  # 嫌疑红点
-            for i, it in enumerate(items):
-                self._table.setItem(row, i, it)
-
+    def _restore_ui_prefs(self) -> None:
+        """启动恢复 UI 偏好(需求 6): 窗口几何 / 表头状态 / 最后目录。"""
+        if self._cfg.ui_window_geometry:
+            self.restoreGeometry(QByteArray.fromBase64(
+                self._cfg.ui_window_geometry.encode("ascii")))
+        if self._cfg.ui_header_state:
+            self._table.horizontalHeader().restoreState(QByteArray.fromBase64(
+                self._cfg.ui_header_state.encode("ascii")))
+        if self._cfg.ui_last_mods_dir:
+            self._dir_edit.setText(self._cfg.ui_last_mods_dir)
     # ---------------------------------------------------------------- 通用 worker
 
     def _spawn(self, fn, *args, on_done, on_fail) -> None:
-        """启动后台任务并持引用(防 GC); 结果/异常回投 UI 线程。"""
+        """后台任务: 集合持引用防 GC(并发安全), 回投后自摘。"""
         w = _Worker(fn, *args)
-        w.done.connect(on_done)
-        w.fail.connect(on_fail)
-        self._active_worker = w
+        self._workers.add(w)
+
+        def _done(res, w=w):
+            self._workers.discard(w)
+            on_done(res)
+
+        def _failed(err, w=w):
+            self._workers.discard(w)
+            on_fail(err)
+
+        w.done.connect(_done)
+        w.fail.connect(_failed)
         w.start()
+
+    def _on_task_fail(self, err: str) -> None:
+        """通用后台任务失败(轻任务: 快照创建等): 日志 + 回 READY。"""
+        self._log(f"[错误] 后台任务失败: {err}")
+        self._set_state(UiState.READY, f"操作失败: {err}")
 
     # ---------------------------------------------------------------- 扫描
 
@@ -259,6 +371,8 @@ class MainWindow(QMainWindow):
         w_jars = [j for j in res.jars if j.enabled]  # W = 初始启用集
         if not w_jars:
             self._engine = self._graph = self._executor = None
+            self._ensure_panel()       # 画框随图拆除
+            self._build_reverse_adj()
             self._refresh_table()
             self._refresh_indicators()
             self._set_state(
@@ -274,9 +388,13 @@ class MainWindow(QMainWindow):
                       "(互为唯一依赖, 物理上不可分)")
         self._executor = Executor(res.jars, self._cfg)
         self._engine = None  # 全新扫描 → 会话未开始
+        self._ensure_panel()          # 画框换血(新图新 jar 集)
+        self._build_reverse_adj()     # 级联缓存重建
+        self._ignored_missing.clear() # 新扫描重置修补忽视表(目录可能已换)
         self._refresh_table()
         self._refresh_indicators()
         self._set_state(UiState.READY, "就绪。点「开始排查」进入基准轮")
+        self._run_repair_check()      # 缺失依赖修补提议(需求 8)
 
     def _on_scan_fail(self, err: str) -> None:
         self._set_state(UiState.IDLE, f"扫描失败: {err}")
@@ -310,6 +428,8 @@ class MainWindow(QMainWindow):
         self._executor = Executor(rr.scan.jars, self._cfg)
         self._dir_edit.setText(rr.scan.mods_dir)
         self._watcher_teardown()
+        self._ensure_panel()       # 画框随新图换血
+        self._build_reverse_adj()  # 级联缓存重建(忽视表保留: 同会话延续)
         self._refresh_table()
         self._refresh_indicators()
         self._log(f"[会话] 恢复成功: {len(rr.engine.history)} 轮历史已重放")
@@ -328,12 +448,344 @@ class MainWindow(QMainWindow):
     def _watcher_ensure(self) -> None:
         """为当前实例根建立并武装 watcher(重复调用先拆旧)。"""
         self._watcher_teardown()
-
         self._watcher = Watcher(self._scan.instance_root)
         self._watcher.game_launched.connect(self._on_game_launched)
         self._watcher.crash_detected.connect(self._on_crash)
         self._watcher.arm()
         self._log("[观察] 已监听 logs/latest.log 与 crash-reports/")
+
+    # ---------------------------------------------------------------- 表格
+
+    def _mk_item(self, text: str, key, base: str | None = None) -> _KeyItem:
+        """造排序键表格项; base 给状态列携带(行身份, 排序后行号漂移)。"""
+        it = _KeyItem(text)
+        it.setData(Qt.ItemDataRole.UserRole, key)
+        if base:
+            it.setData(_JAR_ROLE, base)
+        return it
+
+    def _refresh_table(self) -> None:
+        """全量重建表格: 禁用行灰显, 嫌疑行黄点(键排序, 需求 1/2)。"""
+        if self._scan is None:
+            self._table.setRowCount(0)
+            return
+        suspects = self._engine.suspects if self._engine else frozenset()
+        header = self._table.horizontalHeader()
+        sort_col = header.sortIndicatorSection()
+        sort_order = header.sortIndicatorOrder()
+        self._table.setSortingEnabled(False)  # 填充期禁排序(逐行插入会跳行)
+        jars = self._scan.jars
+        self._table.setRowCount(len(jars))
+        for row, j in enumerate(jars):
+            nkey = name_key(j.label)  # 名称拼音键(需求 1)
+            items = [
+                self._mk_item("启用" if j.enabled else "禁用",
+                              (j.enabled, nkey), base=j.base_name),
+                self._mk_item(j.label, nkey),
+                self._mk_item(j.mtime_str, (j.mtime, nkey)),  # 需求 2: 最后修改
+                self._mk_item(j.version, (version_key(j.version), nkey)),
+                self._mk_item(j.source, (j.source, nkey)),
+                self._mk_item("●" if j.base_name in suspects else "",
+                              (j.base_name in suspects, nkey)),
+            ]
+            if not j.enabled:
+                for it in items:  # 禁用行整体灰显
+                    it.setForeground(QColor(TEXT_DIM))
+            else:
+                items[0].setForeground(QColor(GREEN))  # 启用状态绿(需求 9)
+            items[5].setForeground(QColor(YELLOW))     # 嫌疑标记黄(需求 9)
+            for i, it in enumerate(items):
+                self._table.setItem(row, i, it)
+        self._table.setSortingEnabled(True)
+        header.setSortIndicator(sort_col, sort_order)  # 重放用户当前排序
+        if self._panel is not None and self._panel.isVisible():
+            self._panel.refresh()  # 画框状态同步(启停变化后)
+
+    # ---------------------------------------------------------------- 依赖画框
+
+    def _ensure_panel(self) -> None:
+        """(重)创建依赖画框: 重扫后图与 jar 集是新对象, 画框必须换血。"""
+        if self._panel is not None:
+            self._root_layout.removeWidget(self._panel)
+            self._panel.deleteLater()
+            self._panel = None
+            self._panel_base = ""
+        if self._graph is None or self._scan is None:
+            return
+        self._panel = DepPanel(self._graph, self._scan.jars)
+        self._panel.closed.connect(self._on_panel_closed)
+        # 定位: 状态行之后, 表格之前(布局项索引 3)
+        self._root_layout.insertWidget(3, self._panel)
+
+    def _on_panel_closed(self) -> None:
+        self._panel_base = ""
+
+    def _show_dep_panel(self, base: str) -> None:
+        """画框开关: 同条目再双击 = 收起(需求 4)。"""
+        if self._panel is None:
+            return
+        if self._panel_base == base and self._panel.isVisible():
+            self._panel.setVisible(False)
+            self._panel_base = ""
+            return
+        self._panel_base = base
+        self._panel.show_for(base)
+    # ---------------------------------------------------------------- 自由开关(级联, 需求 3)
+
+    def _build_reverse_adj(self) -> None:
+        """预计算反向邻接(提供者 jar → 依赖它的 jar 集), 双击级联 O(V) 直查。
+
+        正向边(j 依赖 d)在 depgraph; 反向闭包是调度侧查询(级联启停专属),
+        不污染纯图层的 API。
+        """
+        self._rev_adj = {}
+        if self._graph is None:
+            return
+        for j, deps in self._graph.jar_deps.items():
+            for d in deps:
+                for p in self._graph.providers.get(d, ()):
+                    self._rev_adj.setdefault(p, set()).add(j)
+
+    def _dependents_closure(self, base: str) -> set[str]:
+        """base + 全部传递依赖它的 jar 集(反向 BFS, 需求 3)。"""
+        out = {base}
+        frontier = [base]
+        while frontier:
+            cur = frontier.pop()
+            for nxt in self._rev_adj.get(cur, ()):
+                if nxt not in out:
+                    out.add(nxt)
+                    frontier.append(nxt)
+        return out
+
+    def _on_cell_double(self, row: int, col: int) -> None:
+        """双击分发: 状态列 = 级联启停(需求 3); 其他列 = 依赖画框(需求 4)。"""
+        item = self._table.item(row, 0)  # 行身份恒由状态列携带
+        if item is None:
+            return
+        base = item.data(_JAR_ROLE)
+        if not base:
+            return
+        if col == 0:
+            self._toggle_cascade(base)
+        else:
+            self._show_dep_panel(base)
+
+    def _toggle_cascade(self, base: str) -> None:
+        """双击状态格: 级联切换启停(需求 3)。
+
+        级联集 = base + 传递依赖它的(两方向同集, 对称):
+        - 禁用: 与引擎闭包同向(禁它会拖死整条依赖链)
+        - 启用: 字面执行"同步改变依赖它的"(连带拉起, 免缺依赖)
+        仅空闲态可用; 会话进行中请先中止(防磁盘态与引擎推理脱钩)。
+        """
+        if self._state not in (UiState.IDLE, UiState.READY, UiState.DONE):
+            self._log("[开关] 排查进行中, 请先中止会话再自由开关")
+            return
+        if self._scan is None or self._executor is None:
+            return
+        jar = next((j for j in self._scan.jars if j.base_name == base), None)
+        if jar is None:
+            return
+        cascade = self._dependents_closure(base)
+        cur = {j.base_name for j in self._scan.jars if j.enabled}
+        if jar.enabled:
+            target = cur - cascade   # 禁: 级联拖死
+            verb = "禁用"
+        else:
+            target = cur | cascade   # 启: 级联拉起
+            verb = "启用"
+        names = sorted(cascade)
+        self._log(f"[开关] {verb} {jar.label}, 级联 {len(cascade)} 个: "
+                  + ", ".join(names[:8]) + ("…" if len(names) > 8 else ""))
+        self._set_state(UiState.APPLYING, f"正在{verb} {jar.label}(级联)…")
+        self._spawn(self._executor.apply, frozenset(target),
+                    on_done=self._on_cascade_done, on_fail=self._on_apply_fail)
+
+    def _on_cascade_done(self, report: ApplyReport) -> None:
+        """自由开关完成(与会话轮共用 executor, 不驱动引擎)。"""
+        if not report.ok:
+            self._handle_apply_failure(report)
+            return
+        self._refresh_table()
+        self._set_state(UiState.READY,
+                        f"开关完成, 改名 {len(report.renamed)} 个文件")
+
+    # ---------------------------------------------------------------- 快照(需求 5)
+
+    def _on_snapshot_create(self) -> None:
+        """创建当前状态快照: 全部 mod 启停状态全集落盘。"""
+        if self._scan is None:
+            return
+        self._spawn(create_snapshot, self._scan,
+                    on_done=self._on_snapshot_created,
+                    on_fail=self._on_task_fail)
+
+    def _on_snapshot_created(self, path: str | None) -> None:
+        if path:
+            self._log(f"[快照] 已保存: {os.path.basename(path)}")
+        else:
+            self._log("[快照] 保存失败(目录不可写?)")
+
+    def _on_snapshot_restore(self) -> None:
+        """恢复快照: 选档 → 一致性检查确认 → 幂等 diff 到目标态。"""
+        if self._scan is None or self._executor is None:
+            return
+        items = list_snapshots()
+        if not items:
+            QMessageBox.information(self, "恢复快照", "没有可用的快照")
+            return
+        dlg = SnapshotDialog(items, self)
+        if not dlg.exec() or dlg.selected is None:
+            return
+        data = load_snapshot(dlg.selected)
+        if data is None:
+            QMessageBox.warning(self, "恢复快照", "快照文件损坏或版本不兼容")
+            return
+        warns = snapshot_check(data, self._scan)
+        if warns:
+            ret = QMessageBox.warning(
+                self, "恢复快照",
+                "快照与当前目录存在差异:\n\n" + "\n".join(warns) + "\n\n仍然恢复?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if ret is not QMessageBox.StandardButton.Yes:
+                return
+        target = snapshot_target(data, self._scan)
+        self._log(f"[快照] 恢复: {os.path.basename(dlg.selected)}"
+                  f"(目标启用 {len(target)} 个)")
+        self._set_state(UiState.APPLYING, "正在恢复快照…")
+        self._spawn(self._executor.apply, target,
+                    on_done=self._on_snapshot_restored,
+                    on_fail=self._on_apply_fail)
+
+    def _on_snapshot_restored(self, report: ApplyReport) -> None:
+        if not report.ok:
+            self._handle_apply_failure(report)
+            return
+        self._refresh_table()
+        self._log(f"[快照] 恢复完成, 改名 {len(report.renamed)} 个文件")
+        self._set_state(UiState.READY, "已恢复到快照状态")
+
+    # ---------------------------------------------------------------- 修补(需求 8)
+
+    def _run_repair_check(self) -> None:
+        """扫描后: 缺失依赖逐条反查 → 用户裁决 → 后台改写(成功自动重扫)。
+
+        修补在途即 return(剩余缺失交给重扫后的下一轮检查, 串行收敛);
+        失败也记入忽视表(防"重扫→再弹→再失败"死循环)。
+        """
+        if not self._graph or not self._graph.missing:
+            return
+        pending = [(b, m) for b, m in self._graph.missing
+                   if (b, m) not in self._ignored_missing]
+        for decl_base, missing_id in pending:
+            cands, layer = find_candidates(missing_id, self._scan, decl_base)
+            if not cands:
+                self._log(f"[修补] {decl_base} 缺失依赖 {missing_id}: "
+                          "没有文件名匹配的候选")
+                continue
+            dj = next((j for j in self._scan.jars
+                       if j.base_name == decl_base), None)
+            matches = []
+            for c in cands:
+                cj = next((j for j in self._scan.jars
+                           if j.base_name == c), None)
+                if cj and cj.mods:
+                    matches.append((c, cj.label, cj.mods[0].modid))
+            if not matches:
+                continue
+            dlg = RepairDialog(dj.label if dj else decl_base, missing_id,
+                               matches, layer, self)
+            dlg.exec()
+            if dlg.choice is None:
+                self._ignored_missing.add((decl_base, missing_id))
+                self._log(f"[修补] 已忽视: {decl_base} 的缺失依赖 {missing_id}")
+                continue
+            cj = next((j for j in self._scan.jars
+                       if j.base_name == dlg.choice), None)
+            if cj is None or not cj.mods:
+                continue
+            old_id = cj.mods[0].modid
+            # 禁用态文件也修: 按实际磁盘路径改写
+            path = cj.current_path(self._cfg.disabled_suffix)
+            self._log(f"[修补] 改写 {dlg.choice}: modId {old_id} → {missing_id}…")
+            self._spawn(patch_modid, path, old_id, missing_id,
+                        on_done=lambda r: self._on_repair_done(
+                            r, dlg.choice, missing_id),
+                        on_fail=lambda e: self._on_repair_fail(
+                            e, (dlg.choice, missing_id)))
+            return  # 修补在途: 剩余缺失交给重扫后的下一轮检查
+
+    def _on_repair_done(self, result: str | None, base: str,
+                        missing_id: str) -> None:
+        """修补回投: 空闲态自动重扫; 会话已开跑则不打断(改 jar 不影响
+        启停推理, 只是新图要等下次扫描才接通边)。"""
+        if result is None:
+            if self._state in (UiState.IDLE, UiState.READY, UiState.DONE):
+                self._log(f"[修补] {base} 已改为 {missing_id}, 自动重新扫描…")
+                self._on_scan()  # 重扫重建图(新 missing 继续处理, 串行收敛)
+            else:
+                self._ignored_missing.add((base, missing_id))
+                self._log(f"[修补] {base} 已改为 {missing_id}, "
+                          "但会话进行中不打断 — 结束后请手动重新扫描")
+        else:
+            self._ignored_missing.add((base, missing_id))
+            self._log(f"[修补] {base} 失败: {result}")
+
+    def _on_repair_fail(self, err: str, key: tuple[str, str]) -> None:
+        self._ignored_missing.add(key)
+        self._log(f"[修补] 后台改写异常: {err}")
+    # ---------------------------------------------------------------- 判决(右列按钮, 需求 7)
+
+    def _enter_judging(self) -> None:
+        """进入判决态: 右列按钮接管(原模态弹窗退役)。"""
+        self._set_state(UiState.JUDGING, "本轮结束, 请在右侧按钮作答")
+        if self._crash_flag:
+            # 崩溃警告: 状态行橙色加粗(替代原模态红横幅, 信息同源)
+            self._lbl_status.setText(
+                "警告: 本轮游戏发生崩溃, 观察结果可能无效 — 建议重新测试本轮")
+            self._lbl_status.setStyleSheet(
+                f"color: {ORANGE}; font-weight: bold;")
+
+    def _on_judge_present(self) -> None:
+        self._submit_answer(Answer.PRESENT)
+
+    def _on_judge_absent(self) -> None:
+        self._submit_answer(Answer.ABSENT)
+
+    def _on_judge_skip(self) -> None:
+        # 跳过仅基准轮合法(引擎侧有二次防御, 其他轮按钮不可见)
+        self._submit_answer(Answer.SKIP)
+
+    def _on_judge_retest(self) -> None:
+        """本轮作废: 引擎不推进, 同计划幂等重走(磁盘已是目标态, 零改名)。"""
+        if self._state is not UiState.JUDGING:
+            return
+        self._log("[轮] 本轮作废, 重新测试")
+        self._begin_round()
+
+    def _submit_answer(self, answer) -> None:
+        if self._state is not UiState.JUDGING:
+            return
+        # 用户在崩溃警告下仍作答 = 用户自主确认本轮信号有效
+        action = self._engine.report(
+            answer, self._last_report.actual_disabled, crashed=False)
+        save_session(self._scan, self._engine)
+        if action is Action.DONE:
+            self._finish()
+            return
+        # NEXT_PLAN(推进)/RETEST_SAME(引擎侧作废): 统一重走一轮
+        self._begin_round()
+
+    # ---------------------------------------------------------------- 调试直通(需求 10)
+
+    def _on_debug_fake_game(self) -> None:
+        """调试通道: 就当我开关过游戏了 — 跳过启动/退出直接进判决。"""
+        if self._state is not UiState.WAIT_LAUNCH:
+            return
+        self._log("[调试] 跳过游戏启动, 直接进入判决")
+        self._enter_judging()
 
     # ---------------------------------------------------------------- 轮次循环
 
@@ -419,7 +871,7 @@ class MainWindow(QMainWindow):
         self._procmon.game_exited.connect(self._on_game_exited)
         self._procmon.start_tracking()
         self._set_state(UiState.WAIT_GAME,
-                        "游戏运行中…(结束后会自动弹出判定)")
+                        "游戏运行中…(结束后请在右侧按钮作答)")
 
     def _on_procmon_status(self, msg: str) -> None:
         if self._state is UiState.WAIT_GAME:
@@ -434,29 +886,7 @@ class MainWindow(QMainWindow):
     def _on_game_exited(self) -> None:
         if self._state is not UiState.WAIT_GAME:
             return
-        self._set_state(UiState.JUDGING, "游戏已结束, 请回答本轮结果")
-        dlg = JudgeDialog(self._current_plan, self._crash_flag,
-                          sorted(self._last_report.actual_disabled), self)
-        if dlg.exec():
-            self._submit_answer(dlg.answer)     # accept = 有效答案
-            return
-        if dlg.retest:
-            # 本轮作废: 引擎不推进, 同计划幂等重走(磁盘已是目标态, 零改名)
-            self._log("[轮] 本轮作废, 重新测试")
-            self._begin_round()
-            return
-        self._on_abort()  # 直接关窗 = 放弃回答 → 中止询问
-
-    def _submit_answer(self, answer) -> None:
-        # 用户在崩溃横幅下仍给出答案 = 用户确认本轮信号有效(其自主判断)
-        action = self._engine.report(
-            answer, self._last_report.actual_disabled, crashed=False)
-        save_session(self._scan, self._engine)
-        if action is Action.DONE:
-            self._finish()
-            return
-        # NEXT_PLAN(推进)/RETEST_SAME(作废): 引擎侧状态已定, 统一重走一轮
-        self._begin_round()
+        self._enter_judging()  # 判决交右列按钮(非模态)
 
     # ---------------------------------------------------------------- 终局与还原
 
@@ -490,7 +920,7 @@ class MainWindow(QMainWindow):
 
     def _on_abort(self) -> None:
         if self._state not in (UiState.APPLYING, UiState.WAIT_LAUNCH,
-                               UiState.WAIT_GAME):
+                               UiState.WAIT_GAME, UiState.JUDGING):
             return
         box = QMessageBox(self)
         box.setWindowTitle("中止排查")
@@ -516,9 +946,22 @@ class MainWindow(QMainWindow):
         else:
             self._set_state(UiState.READY, "已中止(mod 状态保持当前)")
 
+    # ---------------------------------------------------------------- 关窗
+
     def closeEvent(self, event) -> None:
-        """关窗收尸: 拆 watchdog 线程, 防进程悬挂。"""
+        """关窗收尸: 拆 watchdog 线程, 持久化 UI 偏好(需求 6)。"""
         self._watcher_teardown()
         if self._procmon is not None:
             self._procmon.stop()
+        try:
+            # 三件套: 窗口几何 / 表头(列宽列序排序) / 最后目录 → config.json
+            self._cfg.ui_window_geometry = bytes(
+                self.saveGeometry().toBase64()).decode("ascii")
+            self._cfg.ui_header_state = bytes(
+                self._table.horizontalHeader().saveState().toBase64()
+            ).decode("ascii")
+            self._cfg.ui_last_mods_dir = self._dir_edit.text().strip()
+            save_config(self._cfg)
+        except (OSError, ValueError):
+            pass  # 偏好持久化失败不阻关窗(下次用默认布局)
         super().closeEvent(event)

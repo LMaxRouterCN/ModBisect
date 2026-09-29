@@ -386,6 +386,116 @@ def test_session(tmp: str, cfg: AppConfig) -> None:
     check("缺失jar拒绝", (not rr3.ok) and "不在" in rr3.reason, rr3.reason)
 
 
+# ---------------------------------------------------------------- v0.2 新增
+
+def test_sortkey() -> None:
+    """v0.2: 拼音排序键与版本分段键(sortkey.py)。"""
+    print("[sortkey]")
+    from modbisect.sortkey import name_key, version_key
+    check("拼音键中英统一", name_key("EMI Loot") == "emiloot")
+    check("拼音键大小写不敏感", name_key("Just Enough Items")
+          == name_key("just enough items"))
+    check("拼音键滤空格符号", name_key("能源装置 Energy")
+          == name_key("能源装置Energy"))
+    check("拼音键纯中文", name_key("能源") == "nengyuan")
+    check("空名键", name_key("  ") == "")
+    check("版本数值分段", version_key("1.10.2") > version_key("1.9.4"))
+    check("版本跨位", version_key("1.20.1-forge") < version_key("1.20.2"))
+    check("版本缺位", version_key("2.0") < version_key("2.0.1"))
+    check("空版本", version_key("") == ())
+    check("版本数字后缀", version_key("1.0a") < version_key("1.0b")
+          < version_key("2"))
+
+
+def test_depgraph_missing(graph: DependencyGraph) -> None:
+    """v0.2: depgraph.missing 结构化清单(修补系统的输入)。"""
+    print("[depgraph.missing]")
+    check("missing结构化", graph.missing == [("w.jar", "modq")],
+          str(graph.missing))
+    check("missing与警告同源",
+          any("modq" in w and "w.jar" in w for w in graph.warnings))
+
+
+def test_snapshots(tmp: str, cfg: AppConfig) -> None:
+    """v0.2: 快照建/列/读/一致性检查/恢复目标(snapshots.py)。"""
+    print("[snapshots]")
+    from modbisect import snapshots as snap_mod
+    from modbisect.model import JarInfo
+    from modbisect.scanner import ScanResult
+    res = scan_mods_dir(os.path.join(tmp, "mods2"), cfg)  # executor 已还原
+    snap_mod.SNAPSHOTS_DIR = os.path.join(tmp, "snapshots-test")  # 重定向
+    path = snap_mod.create_snapshot(res)
+    check("快照落盘", path is not None and os.path.isfile(path))
+    lst = snap_mod.list_snapshots()
+    check("快照列表", len(lst) == 1 and lst[0]["count"] == 5, str(lst))
+    data = snap_mod.load_snapshot(path)
+    check("快照读取", data is not None
+          and data["mods_dir"] == os.path.abspath(res.mods_dir))
+    # 状态翻转后目标集仍取自快照(不是当前态)
+    for j in res.jars:
+        j.enabled = (j.base_name == "z.jar")
+    check("恢复目标集", snap_mod.snapshot_target(data, res)
+          == frozenset({"x.jar", "y.jar", "z.jar", "w.jar"}))
+    # 一致性: 目录不符 / 快照后新增
+    res2 = ScanResult(mods_dir=os.path.join(tmp, "other"), jars=list(res.jars))
+    warns = snap_mod.snapshot_check(data, res2)
+    check("目录不符警告", any("目录" in w for w in warns), str(warns))
+    extra = JarInfo(directory=res.mods_dir, base_name="new.jar",
+                    enabled=True, size=1)
+    res3 = ScanResult(mods_dir=res.mods_dir, jars=list(res.jars) + [extra])
+    warns3 = snap_mod.snapshot_check(data, res3)
+    check("新增jar警告", any("新增" in w for w in warns3), str(warns3))
+    # 磁盘未动, 重扫与快照一致 → 零警告
+    res_new = scan_mods_dir(os.path.join(tmp, "mods2"), cfg)
+    check("一致零警告", snap_mod.snapshot_check(data, res_new) == [])
+
+
+def test_repair(tmp: str) -> None:
+    """v0.2: 修补系统(文件名匹配 + mods.toml modId 改写, repair.py)。"""
+    print("[repair]")
+    from modbisect import repair
+    check("规范化去中文符号",
+          repair.normalize_stem("能源装置 Energy.jar") == "energy")
+    # 场景: target_1.20.jar 的 modId 笔误("wrongid"), decl.jar 依赖 "target"
+    d = os.path.join(tmp, "mods-rep")
+    os.makedirs(d)
+
+    def _mk(path: str, modid: str, deps: tuple[str, ...] = ()) -> None:
+        t = f'modLoader="javafml"\n[[mods]]\nmodId="{modid}"\nversion="1.0"\n'
+        for dep in deps:
+            t += f'[[dependencies.{modid}]]\nmodId="{dep}"\n'
+        make_jar(path, toml_text=t)
+
+    _mk(os.path.join(d, "target_1.20.jar"), "wrongid")
+    _mk(os.path.join(d, "decl.jar"), "decl", deps=("target",))
+    cfg = AppConfig(disabled_suffix=".disabled")
+    res = scan_mods_dir(d, cfg)
+    w_jars = [j for j in res.jars if j.enabled]
+    g = DependencyGraph(w_jars, cfg.ignore_modids)
+    check("缺失依赖检出", g.missing == [("decl.jar", "target")], str(g.missing))
+    cands, layer = repair.find_candidates("target", res, "decl.jar")
+    check("前缀层匹配", cands == ["target_1.20.jar"] and layer == "prefix",
+          str((cands, layer)))
+    # 改写 + 幂等 + 防御 + 备份
+    jp = os.path.join(d, "target_1.20.jar")
+    r = repair.patch_modid(jp, "wrongid", "target")
+    check("改写成功", r is None, str(r))
+    with zipfile.ZipFile(jp) as zf:
+        t = zf.read("META-INF/mods.toml").decode()
+    check("modId已改", 'modId="target"' in t, t)
+    check("旧id退场", "wrongid" not in t, t)
+    check("原件备份", os.path.isfile(jp + ".orig"))
+    check("幂等重复修补", repair.patch_modid(jp, "target", "target") is None)
+    check("防御不符拒写", isinstance(
+        repair.patch_modid(jp, "otherid", "thirdid"), str))
+    # 改写后重扫: 依赖边接通, missing 清零
+    res2 = scan_mods_dir(d, cfg)
+    w2 = [j for j in res2.jars if j.enabled]
+    g2 = DependencyGraph(w2, cfg.ignore_modids)
+    check("修补后边接通", g2.missing == []
+          and set(g2.jar_deps["decl.jar"]) == {"target"})
+
+
 # ---------------------------------------------------------------- main
 
 def main() -> int:
@@ -400,6 +510,10 @@ def main() -> int:
         test_engine_branches(graph, W)
         test_executor(res2, cfg)
         test_session(tmp, cfg)
+        test_sortkey()
+        test_depgraph_missing(graph)
+        test_snapshots(tmp, cfg)
+        test_repair(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"\n结果: {_PASS} 通过, {_FAIL} 失败")
