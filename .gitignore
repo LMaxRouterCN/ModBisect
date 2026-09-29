@@ -1,0 +1,13 @@
+# 运行产物(不入库)
+__pycache__/
+*.pyc
+config.json
+sessions/
+
+# 环境
+.venv/
+.agent/
+.agent_task_logs/
+
+# 一次性补丁脚本(用后即删, 防漏网)
+_patch*.py
