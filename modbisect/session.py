@@ -19,10 +19,10 @@ from datetime import datetime
 
 from .config import SESSIONS_DIR, AppConfig
 from .depgraph import DependencyGraph
-from .engine import Answer, BisectEngine
+from .engine import Answer, BisectEngine, ScanSpec
 from .scanner import ScanResult, scan_mods_dir
 
-SESSION_VERSION = 1
+SESSION_VERSION = 2  # v0.4: +scan_spec(卷帘规格); v1 旧会话仍可恢复
 
 
 @dataclass
@@ -44,7 +44,10 @@ def save_session(scan: ScanResult, engine: BisectEngine) -> str | None:
             "mods_dir": scan.mods_dir,
             "created": datetime.now().isoformat(timespec="seconds"),
             "jars": [
-                {"base": j.base_name, "size": j.size, "enabled": j.enabled}
+                # enabled 位锚定 engine.universe(会话冻结 W):
+                # scan.jars 的启用位是磁盘实时态, 会话中途不等于 W
+                {"base": j.base_name, "size": j.size,
+                 "enabled": j.base_name in engine.universe}
                 for j in scan.jars
             ],
             "history": [
@@ -56,6 +59,16 @@ def save_session(scan: ScanResult, engine: BisectEngine) -> str | None:
                 }
                 for r in engine.history
             ],
+        # v0.4: 卷帘规格(仅卷帘会话存在; 恢复时重建 ScanSpec 再重放,
+        # _scan_pos 由重放自身推进, 无需落盘)
+        **({
+            "scan_spec": {
+                "order": list(engine.scan_spec.order),
+                "chunk": engine.scan_spec.chunk,
+                "enable": engine.scan_spec.enable,
+                "from_top": engine.scan_spec.from_top,
+            },
+        } if engine.scan_spec is not None else {}),
             # 以下为人类可读快照(恢复不依赖它们, 仅列表展示用)
             "phase": engine.phase.value,
             "round": engine.round_index,
@@ -81,7 +94,7 @@ def list_sessions() -> list[dict]:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if data.get("version") != SESSION_VERSION:
+            if data.get("version") not in (1, SESSION_VERSION):
                 continue  # 未来版本的会话: 跳过而不是硬解析
             out.append({
                 "path": path,
@@ -103,7 +116,7 @@ def restore_session(path: str, cfg: AppConfig) -> RestoreResult:
             data = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
         return RestoreResult(ok=False, reason=f"会话文件不可读: {e}")
-    if data.get("version") != SESSION_VERSION:
+    if data.get("version") not in (1, SESSION_VERSION):
         return RestoreResult(ok=False, reason="会话版本不兼容")
 
     # 重扫当前目录(当前启停态可以与会话不同: 中断时正处于二分中间态)
@@ -129,7 +142,15 @@ def restore_session(path: str, cfg: AppConfig) -> RestoreResult:
         return RestoreResult(ok=False, reason="会话初始启用集为空")
     w_jars = [by_base[b] for b in initial_enabled]
     graph = DependencyGraph(w_jars, cfg.ignore_modids)
-    engine = BisectEngine(graph)
+    # v0.4: 卷帘规格重建(v2 会话); v1 无此字段 → 纯二分重放
+    sd = data.get("scan_spec")
+    spec = None
+    if sd:
+        spec = ScanSpec(order=tuple(sd.get("order", ())),
+                        chunk=int(sd.get("chunk", 1)),
+                        enable=bool(sd.get("enable", False)),
+                        from_top=bool(sd.get("from_top", True)))
+    engine = BisectEngine(graph, spec)
 
     # 重放历史: 纯状态转移, 确定性重建中断前状态
     for rec in data.get("history", []):

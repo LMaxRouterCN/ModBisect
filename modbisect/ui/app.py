@@ -42,6 +42,8 @@ from ..sortkey import name_key, version_key
 from ..watcher import Watcher
 from .deptree import DepTreePanel
 from .dialogs import RepairDialog, SnapshotDialog, VerdictDialog
+from ..engine import ScanSpec  # v0.4: 卷帘规格(装配见 _build_engine)
+from PySide6.QtWidgets import QComboBox, QSpinBox  # v0.4: 模式/步长
 from .panels import DepPanel
 from .style import BORDER, GOLD, GREEN, ORANGE, TEXT_DIM, YELLOW
 
@@ -221,6 +223,33 @@ class MainWindow(QMainWindow):
         # ---- 右按钮列(需求 7: 动作集中 + 判决非模态化) ----
         side = QVBoxLayout()
         side.setSpacing(6)
+        # v0.4: 排查模式(经典二分/卷帘四向) + 卷帘步长(仅卷帘可编辑)
+        mode_row = QHBoxLayout()
+        self._combo_mode = QComboBox()
+        for _t, _d in (
+                ("经典二分", "bisect"),
+                ("卷帘·顶到底 禁用", "top_disable"),
+                ("卷帘·顶到底 启用", "top_enable"),
+                ("卷帘·底到顶 禁用", "bottom_disable"),
+                ("卷帘·底到顶 启用", "bottom_enable")):
+            self._combo_mode.addItem(_t, _d)
+        self._combo_mode.setToolTip(
+            "模式在点击「开始排查」时生效, 会话中途更改不影响进行中的排查;"
+            "启用方向首轮会把其余 mod 全部压禁(建议先建快照)")
+        _idx = self._combo_mode.findData(self._cfg.ui_scan_mode)
+        # 先回填索引再接线: 防初始 setCurrentIndex 触发信号时
+        # _spin_chunk 尚未创建(初始化次序防御)
+        self._combo_mode.setCurrentIndex(max(0, _idx))
+        self._spin_chunk = QSpinBox()
+        self._spin_chunk.setRange(1, 50)
+        self._spin_chunk.setValue(self._cfg.ui_scan_chunk)
+        self._spin_chunk.setToolTip("卷帘每轮卷动的 mod 个数")
+        self._spin_chunk.valueChanged.connect(self._on_chunk_changed)
+        self._combo_mode.currentIndexChanged.connect(self._on_mode_changed)
+        mode_row.addWidget(self._combo_mode, stretch=1)
+        mode_row.addWidget(self._spin_chunk)
+        side.addLayout(mode_row)
+        self._on_mode_changed(self._combo_mode.currentIndex())
         # 会话主控(从行2移驻, 右列 = 全部动作的家)
         self._btn_start = QPushButton("开始排查")
         self._btn_start.clicked.connect(self._on_start)
@@ -891,6 +920,44 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- 轮次循环
 
+    def _build_engine(self) -> BisectEngine:
+        """按模式下拉装配引擎(经典二分 / 卷帘四向, v0.4)。
+
+        锁序 = 当前表格显示序滤 W 成员(初始启用集)的冻结快照:
+        原生禁用的可选 DLC / 多版本共存不在 W, 帘带永不触碰
+        [长期记忆: 008]; 开排查后改排序不影响本序。
+        """
+        mode = self._combo_mode.currentData()
+        if mode == "bisect":
+            return BisectEngine(self._graph)
+        # W 锚 = graph.universe(扫描时刻冻结的初始启用集, 不可变):
+        # 不读 self._scan.jars 的实时 enabled 位 —— 就地刷新会把该位
+        # 同步成磁盘实时态, 会话中途不再等于会话 W(b1 教训)
+        w_anchor = self._graph.universe
+        order: list[str] = []
+        for r in range(self._table.rowCount()):
+            it = self._table.item(r, 0)
+            if it is not None:
+                b = it.data(_JAR_ROLE)
+                if b in w_anchor:
+                    order.append(b)
+        from_top = not mode.startswith("bottom")
+        if not from_top:
+            order.reverse()  # 底到顶: 显示序反转即卷动序
+        spec = ScanSpec(order=tuple(order), chunk=self._spin_chunk.value(),
+                        enable=mode.endswith("enable"), from_top=from_top)
+        return BisectEngine(self._graph, spec)
+
+    def _on_mode_changed(self, idx: int) -> None:
+        """模式切换: 持久化 + 步长旋钮仅卷帘模式可编辑。"""
+        mode = self._combo_mode.itemData(idx)
+        self._cfg.ui_scan_mode = mode if mode else "bisect"
+        self._spin_chunk.setEnabled(self._cfg.ui_scan_mode != "bisect")
+
+    def _on_chunk_changed(self, v: int) -> None:
+        """步长变更: 持久化(会话中更改不影响已冻结的卷动序)。"""
+        self._cfg.ui_scan_chunk = v
+
     def _on_start(self) -> None:
         if self._apply_busy:  # v0.3.1: 开关在途, 延后开始(磁盘写互斥)
             self._log("[开关] 启停切换进行中, 稍后再开始排查")
@@ -898,8 +965,15 @@ class MainWindow(QMainWindow):
         if self._state is not UiState.READY or self._scan is None:
             return
         if self._engine is None:
-            self._engine = BisectEngine(self._graph)
-            self._log(f"[会话] 开始排查: 嫌疑单元 {self._engine.suspect_count}")
+            self._engine = self._build_engine()
+            _m = self._combo_mode.currentData()
+            _tag = "经典二分" if _m == "bisect" else (
+                "卷帘·" + ("顶到底 " if _m.startswith("top")
+                           else "底到顶 ")
+                + ("启用" if _m.endswith("enable") else "禁用")
+                + f", 每轮 {self._spin_chunk.value()} 个")
+            self._log(f"[会话] 开始排查({_tag}): "
+                      f"嫌疑单元 {self._engine.suspect_count}")
         else:
             if self._engine.verdict is not None:
                 # 恢复的会话已终局(引擎所有 DONE 路径必设 verdict,

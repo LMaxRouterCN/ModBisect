@@ -21,7 +21,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from modbisect.config import AppConfig
 from modbisect.scanner import scan_mods_dir
 from modbisect.depgraph import DependencyGraph
-from modbisect.engine import Answer, Action, Phase, BisectEngine
+from modbisect.engine import (Answer, Action, Phase, BisectEngine,
+                               ScanSpec)
 from modbisect.executor import Executor
 from modbisect import session as session_mod
 
@@ -496,6 +497,117 @@ def test_repair(tmp: str) -> None:
           and set(g2.jar_deps["decl.jar"]) == {"target"})
 
 
+def test_engine_scan(graph: DependencyGraph) -> None:
+    """卷帘模式(v0.4): 四组合公式/锁段转二分/卷尽未命中/静默底场。
+
+    场景(与主测试同图, 实测): W={w,x,y,z}, 单元 {w},{x,y}(SCC),{z};
+    x 与 y 互为依赖(闭包互拖), z 无依赖。锁序=字典序。
+    """
+    order = tuple(sorted(graph.universe))  # (w, x, y, z)
+
+    # --- 禁用方向: 消失锁段(嫌疑收缩进实际被禁单元) ---
+    e = BisectEngine(graph, ScanSpec(order=order, chunk=2, enable=False,
+                                     from_top=True))
+    check("卷帘默认基准", e.phase is Phase.BASELINE
+          and e.current_plan.phase is Phase.BASELINE)
+    a = e.report(Answer.SKIP, frozenset())
+    check("基准跳过进SCAN", a is Action.NEXT_PLAN
+          and e.phase is Phase.SCAN)
+    b1 = graph.closure({"w.jar", "x.jar"}, set(graph.universe))
+    p = e.current_plan
+    check("禁向帘带闭包拖拽", p.proposed_disabled == frozenset(b1),
+          str(sorted(p.proposed_disabled)))
+    check("禁向其余全启用",
+          p.target_enabled == graph.universe - frozenset(b1))
+    a = e.report(Answer.ABSENT, frozenset(b1))
+    check("禁向消失锁段转二分", a is Action.NEXT_PLAN
+          and e.phase is Phase.BISECT)
+    check("禁向嫌疑收缩", e.suspects == frozenset(b1),
+          str(sorted(e.suspects)))
+    check("锁段后二分计划", e.current_plan.phase is Phase.BISECT)
+
+    # --- 禁用方向: 步长1逐卷, 帘带含已卷前缀的闭包重算 ---
+    e2 = BisectEngine(graph, ScanSpec(order=order, chunk=1, enable=False,
+                                      from_top=True))
+    e2.report(Answer.SKIP, frozenset())
+    p = e2.current_plan
+    check("禁向步长1首带", p.proposed_disabled
+          == frozenset({"w.jar"}))
+    a = e2.report(Answer.PRESENT, frozenset({"w.jar"}))
+    check("禁向还在出局w", a is Action.NEXT_PLAN
+          and e2.phase is Phase.SCAN
+          and e2.suspects == frozenset({"x.jar", "y.jar", "z.jar"}))
+    p = e2.current_plan
+    # 帘带={x}, 但闭包拖入 y, 且已卷的 w 仍在实际禁用集内
+    check("禁向第2带含前缀闭包", p.proposed_disabled
+          == frozenset({"w.jar", "x.jar", "y.jar"}),
+          str(sorted(p.proposed_disabled)))
+    a = e2.report(Answer.PRESENT, frozenset({"w.jar", "x.jar", "y.jar"}))
+    check("禁向嫌疑独苗仍SCAN", a is Action.NEXT_PLAN
+          and e2.phase is Phase.SCAN
+          and e2.suspects == frozenset({"z.jar"}))
+    p = e2.current_plan
+    # 帘带={y}: 闭包仍拖 x, 嫌疑无收缩但指针恒进(无退化死循环)
+    check("禁向第3带", p.proposed_disabled
+          == frozenset({"w.jar", "x.jar", "y.jar"}))
+    a = e2.report(Answer.PRESENT, frozenset({"w.jar", "x.jar", "y.jar"}))
+    check("禁向第3带仍SCAN", a is Action.NEXT_PLAN
+          and e2.phase is Phase.SCAN)
+    p = e2.current_plan
+    check("禁向末带={z}", p.proposed_disabled == frozenset(graph.universe))
+    a = e2.report(Answer.PRESENT, frozenset(graph.universe))
+    check("禁向卷尽矛盾终局", a is Action.DONE
+          and e2.verdict is not None
+          and "卷帘未命中" in e2.verdict.title)
+
+    # --- 禁用方向: 一步卷尽 + 整域消失锁段 + 锁段后二分接管 ---
+    e3 = BisectEngine(graph, ScanSpec(order=order, chunk=4, enable=False,
+                                      from_top=True))
+    e3.report(Answer.SKIP, frozenset())
+    a = e3.report(Answer.ABSENT, frozenset(graph.universe))
+    check("禁向整段消失锁段", a is Action.NEXT_PLAN
+          and e3.phase is Phase.BISECT
+          and e3.suspects == graph.universe)
+    p = e3.current_plan
+    a = e3.report(Answer.PRESENT, frozenset(p.proposed_disabled))
+    check("锁段后二分正常收敛", a is Action.NEXT_PLAN
+          and e3.suspect_count == 1)
+
+    # --- 启用方向: 静默底场(仅首带支撑闭包启用) + 出现锁段 ---
+    e4 = BisectEngine(graph, ScanSpec(order=order, chunk=2, enable=True,
+                                      from_top=True))
+    e4.report(Answer.SKIP, frozenset())
+    p = e4.current_plan
+    check("启用向静默底场", p.target_enabled
+          == frozenset({"w.jar", "x.jar", "y.jar"}),
+          str(sorted(p.target_enabled)))
+    check("启用向压禁集", p.proposed_disabled == frozenset({"z.jar"}))
+    a = e4.report(Answer.PRESENT, frozenset({"z.jar"}))
+    check("启用向出现锁段", a is Action.NEXT_PLAN
+          and e4.phase is Phase.BISECT)
+    check("启用向嫌疑=实际启用", e4.suspects
+          == frozenset({"w.jar", "x.jar", "y.jar"}),
+          str(sorted(e4.suspects)))
+
+    # --- 启用方向: 消失继续卷 + 支撑闭包提前上场 + 末段锁段 ---
+    e5 = BisectEngine(graph, ScanSpec(order=order, chunk=2, enable=True,
+                                      from_top=True))
+    e5.report(Answer.SKIP, frozenset())
+    a = e5.report(Answer.ABSENT, frozenset({"z.jar"}))
+    check("启用向消失继续卷", a is Action.NEXT_PLAN
+          and e5.phase is Phase.SCAN)
+    check("启用向嫌疑剔除启用侧", e5.suspects == frozenset({"z.jar"}))
+    p = e5.current_plan
+    # 帘带={y,z}: support({y,z})={x,y,z} 提前上场, 加前缀 {w,x} = 全域
+    check("启用向支撑闭包", p.target_enabled == graph.universe,
+          str(sorted(p.target_enabled)))
+    check("启用向全域启用压禁空", p.proposed_disabled == frozenset())
+    a = e5.report(Answer.PRESENT, frozenset())
+    check("启用向末段锁段直达验证", a is Action.NEXT_PLAN
+          and e5.phase is Phase.VERIFY
+          and e5.suspects == frozenset({"z.jar"}))
+
+
 # ---------------------------------------------------------------- main
 
 def main() -> int:
@@ -508,6 +620,7 @@ def main() -> int:
         test_depgraph(graph, W)
         test_engine(graph, W)
         test_engine_branches(graph, W)
+        test_engine_scan(graph)
         test_executor(res2, cfg)
         test_session(tmp, cfg)
         test_sortkey()

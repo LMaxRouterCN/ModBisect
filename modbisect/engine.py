@@ -46,6 +46,7 @@ class Answer(str, Enum):
 class Phase(str, Enum):
     """会话阶段。"""
     BASELINE = "baseline"  # 基准轮(前提确认)
+    SCAN = "scan"          # 卷帘进行中(v0.4: 锁序逐段卷, 锁定段转二分)
     BISECT = "bisect"      # 二分进行中
     VERIFY = "verify"      # 验证轮(最小复现集隔离验证)
     DONE = "done"          # 终局(读 verdict)
@@ -85,6 +86,20 @@ class Verdict:
     culprit: frozenset[str] = frozenset()  # 确诊罪魁 jar(仅单因结案非空)
 
 
+@dataclass(frozen=True)
+class ScanSpec:
+    """卷帘模式规格(v0.4): 锁序/步长/方向, 会话持久化同源。
+
+    order = 开排查时表格显示序滤 W 成员的冻结快照(之后改排序不影响);
+    enable = True 启用方向(判据=问题出现, 首轮静默底场=W 全禁)。
+    from_top 仅存档语义(方向已折入 order, 底到顶时 UI 预先反转)。
+    """
+    order: tuple[str, ...]  # 卷动顺序(base 名序列, W 域内)
+    chunk: int              # 每轮卷动个数(>=1)
+    enable: bool            # True=启用方向 False=禁用方向
+    from_top: bool          # True=由顶向下(展示语义)
+
+
 class BisectEngine:
     """二分状态机。
 
@@ -92,10 +107,13 @@ class BisectEngine:
     UI 层负责在扫描后过滤出初始启用集再建图(空目录在 UI 层拦截)。
     """
 
-    def __init__(self, graph: DependencyGraph):
+    def __init__(self, graph: DependencyGraph,
+                 scan_spec: ScanSpec | None = None):
         self.graph = graph
         self.universe: frozenset[str] = graph.universe  # 工作域 W
+        self.scan_spec = scan_spec  # None=经典二分; 有值=卷帘接力(v0.4)
         self.phase: Phase = Phase.BASELINE
+        self._scan_pos: int = 0  # 卷帘指针: order 前缀中已卷 jar 数
         # 初始嫌疑 = 全部绑定单元
         self._suspect_units: frozenset[int] = frozenset(range(len(graph.units)))
         self._round_index: int = 0
@@ -144,6 +162,35 @@ class BisectEngine:
                 prompt="验证轮: 仅启用嫌疑 mod 及其必需依赖,确认 bug 是否复现",
                 target_enabled=target,
                 proposed_disabled=self.universe - target,
+                suspects=self.suspects,
+            )
+        if self.phase is Phase.SCAN:
+            # 卷帘轮(v0.4): 帘带 = 锁序中下一 chunk 个(前缀已卷过)
+            spec = self.scan_spec
+            band = spec.order[self._scan_pos:self._scan_pos + spec.chunk]
+            band_set = frozenset(band)
+            if spec.enable:
+                # 启用方向: 静默底场(仅已卷段+帘带支撑闭包启用),
+                # 判据=问题出现; support 拖入的依赖"提前上场",
+                # 记账按执行层实际启用集归算(与闭包拖拽同构)
+                target = (frozenset(spec.order[:self._scan_pos])
+                          | self.graph.support(band_set))
+                eff = self.universe - target
+                prompt = (f"卷帘轮: 启用下一段 {len(band)} 个"
+                          f"(其余 {len(eff)} 个全禁), 测试问题是否出现")
+            else:
+                # 禁用方向: 全启用前提(同基准轮), 逐段禁用(含闭包拖拽)
+                rolled = frozenset(spec.order[:self._scan_pos]) | band_set
+                eff = self.graph.closure(rolled, set(self.universe))
+                target = self.universe - eff
+                prompt = (f"卷帘轮: 禁用下一段 {len(band)} 个, "
+                          "测试问题是否消失")
+            return RoundPlan(
+                index=self._round_index + 1,
+                phase=Phase.SCAN,
+                prompt=prompt,
+                target_enabled=target,
+                proposed_disabled=frozenset(eff),
                 suspects=self.suspects,
             )
         # Phase.BISECT: 嫌疑单元索引排序后均分,提议禁用后半。
@@ -196,6 +243,8 @@ class BisectEngine:
 
         if self.phase is Phase.BASELINE:
             return self._report_baseline(answer)
+        if self.phase is Phase.SCAN:
+            return self._report_scan(answer, actual_disabled)
         if self.phase is Phase.VERIFY:
             return self._report_verify(answer)
         return self._report_bisect(answer, actual_disabled)
@@ -211,8 +260,9 @@ class BisectEngine:
                        "建议: 确认稳定复现条件后再重新开始排查。")
             self.phase = Phase.DONE
             return Action.DONE
-        # PRESENT → 正常进二分;SKIP → 信任用户前提直接进二分
-        self.phase = Phase.BISECT
+        # PRESENT → 进扫描/二分;SKIP → 信任用户前提直接进
+        self.phase = (Phase.SCAN if self.scan_spec is not None
+                      else Phase.BISECT)
         return self._enter_next_phase_or_verify()
 
     def _report_bisect(self, answer: Answer,
@@ -250,6 +300,52 @@ class BisectEngine:
             return Action.DONE
         self._suspect_units = after
         return self._enter_next_phase_or_verify()
+
+    def _report_scan(self, answer: Answer,
+                     actual_disabled: frozenset[str]) -> Action:
+        """卷帘轮归算(v0.4): 四组合统一公式, 命中即锁段转二分。
+
+        记账以执行层回报的实际集为准(D7 教义):
+        - 禁用方向: 实际禁用集 = 帘带+闭包拖拽。还在 → 被禁嫌疑出局
+          (继续卷); 消失 → 嫌疑收缩进实际被禁集(锁段)。
+        - 启用方向: 实际启用集 = W − 实际禁用。还在 → 嫌疑收缩进
+          实际启用集(含支撑闭包提前上场者, 锁段); 消失 → 帘带出局
+          (继续卷)。
+        锁定 = 嫌疑收缩 + phase 切 BISECT(引擎后半段无感知, 单单元
+        自动转 VERIFY); 卷尽未命中 → 信号矛盾同型结案。
+        """
+        spec = self.scan_spec
+        hit_dis = {self.graph.unit_of[j] for j in actual_disabled
+                   if j in self.graph.unit_of}
+        hit_en = {self.graph.unit_of[j]
+                  for j in self.universe - actual_disabled
+                  if j in self.graph.unit_of}
+        before = self._suspect_units
+        if spec.enable:
+            locked = answer is Answer.PRESENT
+            after = (before & hit_en if locked else before - hit_en)
+        else:
+            locked = answer is not Answer.PRESENT
+            after = (before & hit_dis if locked else before - hit_dis)
+        self._round_index += 1
+        self._scan_pos = min(self._scan_pos + spec.chunk,
+                             len(spec.order))
+
+        if not after:
+            # 卷尽未命中: 罪魁不在 W(前提/观察失真), 与信号矛盾同型
+            self._suspect_units = after
+            self.verdict = Verdict(
+                title="卷帘未命中",
+                detail="锁序全部卷完仍未能定位罪魁: 回答链与前提矛盾,"
+                       "或罪魁在初始禁用集/依赖图外。\n"
+                       "建议: 核实问题复现条件后重新排查。")
+            self.phase = Phase.DONE
+            return Action.DONE
+        self._suspect_units = after
+        if locked:
+            self.phase = Phase.BISECT  # 锁段: 后续沿用二分收敛
+            return self._enter_next_phase_or_verify()
+        return Action.NEXT_PLAN
 
     def _report_verify(self, answer: Answer) -> Action:
         unit_jars = self._single_suspect_unit()

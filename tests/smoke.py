@@ -333,6 +333,54 @@ def main() -> int:
         check("确诊报告入日志", "确诊" in win._log_view.toPlainText())
         del VerdictDialog.exec
 
+        # ---- 12.5 卷帘模式(v0.4): 锁序冻结+帘带推进+锁段转二分+往返 ----
+        # 锁序断言全部取自引擎冻结的 spec.order, 不读 apply 后的表格
+        # 显示序(apply 会改变排序键, 事后读表必漂移 —— b1 首版死因)
+        win._combo_mode.setCurrentIndex(1)  # 卷帘·顶到底 禁用
+        app.processEvents()
+        check("卷帘模式持久化", win._cfg.ui_scan_mode == "top_disable")
+        check("步长旋钮解锁", win._spin_chunk.isEnabled())
+        win._on_start()
+        _wait_state(win, "wait_launch", 10.0)
+        check("卷帘基准轮", win._current_plan.phase is Phase.BASELINE)
+        win._on_debug_fake_game()
+        win._on_judge_present()  # 基准在场 → 进卷帘
+        _wait_state(win, "wait_launch", 10.0)
+        check("进卷帘相位", win._current_plan.phase is Phase.SCAN)
+        spec = win._engine.scan_spec
+        check("锁序=W冻结快照", len(spec.order)
+              == len(win._engine.universe), str(spec.order))
+        band = set(spec.order[:spec.chunk])
+        eff = win._engine.graph.closure(band,
+                                        set(win._engine.universe))
+        check("帘带含闭包拖拽", win._current_plan.proposed_disabled
+              == frozenset(eff),
+              str(sorted(win._current_plan.proposed_disabled)))
+        check("帘带外保持启用", win._current_plan.target_enabled
+              == win._engine.universe - frozenset(eff),
+              str(sorted(win._current_plan.target_enabled)))
+        win._on_debug_fake_game()
+        win._on_judge_absent()  # 消失 → 锁段 → 段内转二分
+        _wait_state(win, "wait_launch", 10.0)
+        check("锁段转二分", win._current_plan.phase is Phase.BISECT)
+        check("嫌疑收缩进被禁侧", 0 < len(win._engine.suspects)
+              and win._engine.suspects <= frozenset(eff),
+              str(sorted(win._engine.suspects)))
+        sp = session_mod.save_session(win._scan, win._engine)
+        check("卷帘会话落盘", sp is not None)
+        rr = session_mod.restore_session(sp, cfg)
+        check("卷帘会话恢复", rr.ok and rr.engine.scan_spec is not None,
+              rr.reason)
+        if rr.ok:
+            check("恢复重放状态一致",
+                  rr.engine.phase is win._engine.phase
+                  and rr.engine.suspects == win._engine.suspects
+                  and rr.engine.round_index
+                  == win._engine.round_index)
+        win._combo_mode.setCurrentIndex(0)  # 复位经典二分
+        app.processEvents()
+        check("模式复位", win._cfg.ui_scan_mode == "bisect")
+
         # ---- 13. 弹窗单元(直构直验, 不 exec) ----
         sd = SnapshotDialog([{"path": "a.json", "created": "t1",
                               "mods_dir": "d", "count": 3}])
