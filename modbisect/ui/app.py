@@ -116,6 +116,7 @@ class MainWindow(QMainWindow):
         self._executor: Executor | None = None
         self._engine: BisectEngine | None = None    # None = 会话未开始
         self._watcher: Watcher | None = None
+        self._apply_busy = False  # v0.3.1: 磁盘写在途旗标(轻操作不走状态机)
         self._procmon: ProcessMonitor | None = None
         self._current_plan = None                   # 本轮计划(提示/判决按钮用)
         self._last_report: ApplyReport | None = None
@@ -483,43 +484,92 @@ class MainWindow(QMainWindow):
         return it
 
     def _refresh_table(self) -> None:
-        """全量重建表格: 禁用行灰显, 嫌疑行黄点(键排序, 需求 1/2)。"""
+        """刷新表格: 禁用行灰显, 嫌疑行黄点(键排序, 需求 1/2)。
+
+        v0.3.1 双模自选: 行身份(JAR_ROLE)集与当前 jar 集一致时
+        就地更新(只换 item, 行不清 → 选中高亮天然保留; 级联/
+        快照恢复/会话轮/同集重扫全部受益); 不一致自动全量重建。
+        两模式统一: 身份锚恢复选中(排序重放行号漂移后按身份重
+        选, 多选降级为末位); 信号屏蔽期间树不闪空态。
+        """
         if self._scan is None:
             self._table.setRowCount(0)
             return
         suspects = self._engine.suspects if self._engine else frozenset()
+        before = self._selected_bases()  # 身份锚: 刷新前选中集
         header = self._table.horizontalHeader()
         sort_col = header.sortIndicatorSection()
         sort_order = header.sortIndicatorOrder()
-        self._table.setSortingEnabled(False)  # 填充期禁排序(逐行插入会跳行)
         jars = self._scan.jars
-        self._table.setRowCount(len(jars))
-        for row, j in enumerate(jars):
-            nkey = name_key(j.label)  # 名称拼音键(需求 1)
-            items = [
-                self._mk_item("启用" if j.enabled else "禁用",
-                              (j.enabled, nkey), base=j.base_name),
-                self._mk_item(j.label, nkey),
-                self._mk_item(j.mtime_str, (j.mtime, nkey)),  # 需求 2: 最后修改
-                self._mk_item(j.version, (version_key(j.version), nkey)),
-                self._mk_item(j.source, (j.source, nkey)),
-                self._mk_item("●" if j.base_name in suspects else "",
-                              (j.base_name in suspects, nkey)),
-            ]
-            if not j.enabled:
-                for it in items:  # 禁用行整体灰显
-                    it.setForeground(QColor(TEXT_DIM))
+        cur = []  # 就地可行性: 现有行身份集(item 缺失记 None)
+        for r in range(self._table.rowCount()):
+            it = self._table.item(r, 0)
+            cur.append(it.data(_JAR_ROLE) if it is not None else None)
+        jar_bases = {j.base_name for j in jars}
+        can = (self._table.rowCount() == len(jars)
+               and len(set(cur)) == len(cur) and set(cur) == jar_bases)
+        self._table.blockSignals(True)  # 屏蔽中间噪声: 树不闪空态
+        try:
+            self._table.setSortingEnabled(False)  # 填充期禁排序(逐行插入会跳行)
+            self._table.setRowCount(len(jars))  # 就地=同数无操作; 重建=扩缩行
+            for row, j in enumerate(jars):
+                self._fill_row(row, j, suspects)
+            self._table.setSortingEnabled(True)
+            if can:
+                self._table.sortItems(sort_col, sort_order)  # 键变强制重排
             else:
-                items[0].setForeground(QColor(GREEN))  # 启用状态绿(需求 9)
-            items[5].setForeground(QColor(YELLOW))     # 嫌疑标记黄(需求 9)
-            for i, it in enumerate(items):
-                self._table.setItem(row, i, it)
-        self._table.setSortingEnabled(True)
-        header.setSortIndicator(sort_col, sort_order)  # 重放用户当前排序
+                header.setSortIndicator(sort_col, sort_order)  # 重放用户当前排序
+        finally:
+            self._table.blockSignals(False)
+        # 身份锚恢复选中(全量重建清选区 / 就地排序漂移 → 按身份重选)
+        rows_by_base = {}
+        for r in range(self._table.rowCount()):
+            it = self._table.item(r, 0)
+            if it is not None:
+                b = it.data(_JAR_ROLE)
+                if b:
+                    rows_by_base[b] = r
+        for b in sorted(before):
+            r = rows_by_base.get(b)
+            if r is not None:
+                self._table.selectRow(r)
         if self._panel is not None and self._panel.isVisible():
             self._panel.refresh()  # 画框状态同步(启停变化后)
         if self._tree is not None:
             self._tree.refresh()  # v0.3 左树状态着色同步(启停变化后)
+
+    def _fill_row(self, row: int, j, suspects) -> None:
+        """单行填充(全量/就地共用): v0.3.1 从 _refresh_table 抽取。"""
+        nkey = name_key(j.label)  # 名称拼音键(需求 1)
+        items = [
+            self._mk_item("启用" if j.enabled else "禁用",
+                          (j.enabled, nkey), base=j.base_name),
+            self._mk_item(j.label, nkey),
+            self._mk_item(j.mtime_str, (j.mtime, nkey)),  # 需求 2: 最后修改
+            self._mk_item(j.version, (version_key(j.version), nkey)),
+            self._mk_item(j.source, (j.source, nkey)),
+            self._mk_item("●" if j.base_name in suspects else "",
+                          (j.base_name in suspects, nkey)),
+        ]
+        if not j.enabled:
+            for it in items:  # 禁用行整体灰显
+                it.setForeground(QColor(TEXT_DIM))
+        else:
+            items[0].setForeground(QColor(GREEN))  # 启用状态绿(需求 9)
+        items[5].setForeground(QColor(YELLOW))     # 嫌疑标记黄(需求 9)
+        for i, it in enumerate(items):
+            self._table.setItem(row, i, it)
+
+    def _selected_bases(self) -> set[str]:
+        """当前选中行的身份集(刷新前后选中恢复的锚, v0.3.1)。"""
+        out = set()
+        for idx in self._table.selectionModel().selectedRows():
+            it = self._table.item(idx.row(), 0)
+            if it is not None:
+                b = it.data(_JAR_ROLE)
+                if b:
+                    out.add(b)
+        return out
 
     # ---------------------------------------------------------------- 依赖画框
 
@@ -584,8 +634,8 @@ class MainWindow(QMainWindow):
         """选中行变化(单击/键盘移动) → 左树联动渲染该 jar 的依赖树。
 
         只读联动: 不碰状态机/不弹画框; 行身份恒由状态列携带。
-        全量重建表格会清空选中 → 空选中直接返回(树内容不变,
-        状态刷新由 _refresh_table 末尾的 tree.refresh() 兜底)。
+        v0.3.1: 刷新期信号屏蔽, 身份锚恢复选中的 selectRow 会重新
+        触发本槽(树锚定回选中行); 空选中早退保留为兜底。
         """
         if self._tree is None:
             return
@@ -620,6 +670,8 @@ class MainWindow(QMainWindow):
         - 启用: 字面执行"同步改变依赖它的"(连带拉起, 免缺依赖)
         仅空闲态可用; 会话进行中请先中止(防磁盘态与引擎推理脱钩)。
         """
+        if self._apply_busy:  # v0.3.1: 在途开关防连点(轻操作无门控)
+            return
         if self._state not in (UiState.IDLE, UiState.READY, UiState.DONE):
             self._log("[开关] 排查进行中, 请先中止会话再自由开关")
             return
@@ -639,18 +691,24 @@ class MainWindow(QMainWindow):
         names = sorted(cascade)
         self._log(f"[开关] {verb} {jar.label}, 级联 {len(cascade)} 个: "
                   + ", ".join(names[:8]) + ("…" if len(names) > 8 else ""))
-        self._set_state(UiState.APPLYING, f"正在{verb} {jar.label}(级联)…")
+        self._lbl_status.setText(f"正在{verb} {jar.label}(级联)…")  # v0.3.1: 轻操作不碰状态机
+        self._apply_busy = True  # v0.3.1: 在途旗标(spawn 前置位, 回投清)
         self._spawn(self._executor.apply, frozenset(target),
                     on_done=self._on_cascade_done, on_fail=self._on_apply_fail)
 
     def _on_cascade_done(self, report: ApplyReport) -> None:
-        """自由开关完成(与会话轮共用 executor, 不驱动引擎)。"""
+        """自由开关完成(与会话轮共用 executor, 不驱动引擎)。
+
+        v0.3.1: 轻操作不碰状态机(按钮零闪烁), 原态自保持;
+        表格就地刷新(选中保留, 见 _refresh_table 双模自选)。
+        """
+        self._apply_busy = False  # 旗标先清(report 失败路径同样需要)
         if not report.ok:
             self._handle_apply_failure(report)
             return
         self._refresh_table()
-        self._set_state(UiState.READY,
-                        f"开关完成, 改名 {len(report.renamed)} 个文件")
+        # 保持原态(级联不改变会话语义), 只刷状态行文本
+        self._set_state(self._state, f"开关完成, 改名 {len(report.renamed)} 个文件")
 
     # ---------------------------------------------------------------- 快照(需求 5)
 
@@ -670,6 +728,9 @@ class MainWindow(QMainWindow):
 
     def _on_snapshot_restore(self) -> None:
         """恢复快照: 选档 → 一致性检查确认 → 幂等 diff 到目标态。"""
+        if self._apply_busy:  # v0.3.1: 开关在途, 延后恢复(磁盘写互斥)
+            self._log("[开关] 启停切换进行中, 稍后再恢复快照")
+            return
         if self._scan is None or self._executor is None:
             return
         items = list_snapshots()
@@ -831,6 +892,9 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------- 轮次循环
 
     def _on_start(self) -> None:
+        if self._apply_busy:  # v0.3.1: 开关在途, 延后开始(磁盘写互斥)
+            self._log("[开关] 启停切换进行中, 稍后再开始排查")
+            return
         if self._state is not UiState.READY or self._scan is None:
             return
         if self._engine is None:
@@ -878,6 +942,7 @@ class MainWindow(QMainWindow):
             f"{self._current_plan.prompt} — 请现在启动游戏, 测完正常关闭")
 
     def _on_apply_fail(self, err: str) -> None:
+        self._apply_busy = False  # v0.3.1: worker 异常路径清旗标
         self._set_state(UiState.READY, f"启停切换异常: {err}")
         QMessageBox.critical(
             self, "错误", f"启停切换异常: {err}\n建议重新扫描目录")

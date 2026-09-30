@@ -87,6 +87,21 @@ def _wait_state(win, want: str, timeout: float) -> None:
         time.sleep(0.02)  # 测试专用: 等待后台线程信号回投
 
 
+def _wait_status(win, needle: str, timeout: float) -> None:
+    """事件泵等待状态行文本出现 needle; 超时静默(断言暴露)。
+
+    v0.3.1: 级联不再翻转状态机 → wait_state 失效; 开关入口同步
+    写"正在…"文本(覆盖旧文案 = 隔出等待边界), 完成回投写"开关
+    完成" — 以文本为级联完成信号, 磁盘断言不再竞态。
+    """
+    deadline = time.monotonic() + timeout
+    app = QApplication.instance()
+    while time.monotonic() < deadline:
+        app.processEvents()
+        if needle in win._lbl_status.text():
+            return
+        time.sleep(0.02)  # 测试专用: 事件泵步进
+
 def _row_of(win, base: str) -> int:
     """按行身份(JAR_ROLE)定位行号(排序后行号漂移, 身份恒定)。"""
     for r in range(win._table.rowCount()):
@@ -190,7 +205,7 @@ def main() -> int:
         # ---- 4. 级联禁用: 双击 m0 状态格(m3 依赖 mod0 → 陪葬) ----
         print("[smoke] 双击级联开关…")
         win._on_cell_double(_row_of(win, "m0.jar"), 0)
-        _wait_state(win, "ready", 5.0)
+        _wait_status(win, "开关完成", 5.0)
         dis = _disabled_on_disk(mods)
         check("级联禁用拖死依赖者",
               dis == ["m0.jar.disabled", "m3.jar.disabled"], str(dis))
@@ -204,8 +219,10 @@ def main() -> int:
         hh.setSortIndicator(1, Qt.SortOrder.AscendingOrder)  # 回名称序
 
         # ---- 6. 级联启用: 再双击 m0(连带拉起 m3) ----
+        win._table.selectRow(_row_of(win, "m3.jar"))  # v0.3.1: 确立选中前提
+        app.processEvents()
         win._on_cell_double(_row_of(win, "m0.jar"), 0)
-        _wait_state(win, "ready", 5.0)
+        _wait_status(win, "开关完成", 5.0)
         check("级联启用拉起依赖者", _disabled_on_disk(mods) == [])
         # v0.3: 级联开关后树状态同步(refresh 事件链;
         # 就地突变与 watcher rescan 两时序分支同构收敛于"启用")
@@ -213,6 +230,11 @@ def main() -> int:
         it0 = t._down_tree.topLevelItem(0)
         check("级联后树状态同步=启用", it0 is not None and "启用" in it0.text(0),
               (it0.text(0) if it0 is not None else "EMPTY"))
+
+        # v0.3.1: 就地更新 = 选中保留 + 树锚定(信号屏蔽, refresh 兜底)
+        check("级联后 m3 行仍选中",
+              win._table.item(_row_of(win, "m3.jar"), 0).isSelected())
+        check("级联后树锚定不漂移", "mod3" in t._title.text())
 
         # ---- 7. 依赖画框: 双击名称列展开 / 再点收起 ----
         win._on_cell_double(_row_of(win, "m0.jar"), 1)
@@ -233,7 +255,7 @@ def main() -> int:
         snaps = snap_mod.list_snapshots()
         check("快照已落盘", len(snaps) == 1, str(snaps))
         win._on_cell_double(_row_of(win, "m1.jar"), 0)  # 禁 m1(无级联)
-        _wait_state(win, "ready", 5.0)
+        _wait_status(win, "开关完成", 5.0)
         check("快照前改状态(禁 m1)", _disabled_on_disk(mods) == ["m1.jar.disabled"])
         # 恢复弹窗替身: 模拟"选第一个快照恢复"(无警告 → 不弹确认框)
         def _stub_snap_exec(self) -> bool:
