@@ -25,7 +25,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QAbstractItemView, QFileDialog, QHBoxLayout,
                                QHeaderView, QInputDialog, QLabel, QLineEdit,
                                QMainWindow, QMessageBox, QPlainTextEdit,
-                               QPushButton, QTableWidget, QTableWidgetItem,
+                               QPushButton, QSplitter, QTableWidget, QTableWidgetItem,
                                QVBoxLayout, QWidget)
 
 from ..config import AppConfig, save_config
@@ -40,9 +40,10 @@ from ..snapshots import (create_snapshot, list_snapshots, load_snapshot,
                          snapshot_check, snapshot_target)
 from ..sortkey import name_key, version_key
 from ..watcher import Watcher
+from .deptree import DepTreePanel
 from .dialogs import RepairDialog, SnapshotDialog, VerdictDialog
 from .panels import DepPanel
-from .style import GREEN, ORANGE, TEXT_DIM, YELLOW
+from .style import BORDER, GOLD, GREEN, ORANGE, TEXT_DIM, YELLOW
 
 
 class UiState(Enum):
@@ -129,7 +130,7 @@ class MainWindow(QMainWindow):
         self._ignored_missing: set[tuple[str, str]] = set()  # 已忽视缺失(进程级)
 
         self.setWindowTitle("ModBisect — MC 问题 Mod 二分排查")
-        self.resize(1100, 680)
+        self.resize(1280, 700)  # v0.3: 左树占宽, 主窗加宽
         self._build_ui()
         self._apply_state()
         self._restore_ui_prefs()  # UI 偏好: 几何/表头/最后目录(需求 6)
@@ -141,9 +142,22 @@ class MainWindow(QMainWindow):
         outer = QHBoxLayout(central)   # v0.2: 左主区 + 右按钮列(需求 7)
 
         # ---- 左主区(纵向) ----
-        root = QVBoxLayout()
-        outer.addLayout(root, stretch=1)
+        # v0.3: 左侧依赖树(QSplitter 可拖分栏: 左树 | 中主区)
+        self._tree = DepTreePanel()
+        main_w = QWidget()
+        root = QVBoxLayout(main_w)  # root 装进 main_w(splitter 右半)
         self._root_layout = root  # 依赖画框动态插拔需要(扫描后插到状态行下)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.addWidget(self._tree)
+        split.addWidget(main_w)
+        split.setStretchFactor(0, 0)  # 左树弹性 0: 挤压时主区优先保宽
+        split.setStretchFactor(1, 1)
+        split.setHandleWidth(4)       # 直角窄把手
+        split.setSizes([240, 1040])   # 初始: 树 240px
+        split.setStyleSheet(  # 局部样式: 色值与 style.py 常量同源
+            f"QSplitter::handle {{ background: {BORDER}; }}"
+            f"QSplitter::handle:hover {{ background: {GOLD}; }}")
+        outer.addWidget(split, stretch=1)
 
         # 行1: 目录选择与扫描
         row1 = QHBoxLayout()
@@ -192,6 +206,7 @@ class MainWindow(QMainWindow):
         self._table.setSortingEnabled(True)
         header.setSortIndicator(1, Qt.SortOrder.AscendingOrder)  # 默认名称升序
         self._table.cellDoubleClicked.connect(self._on_cell_double)  # 需求 3/4
+        self._table.itemSelectionChanged.connect(self._on_table_selection)  # v0.3: 左树联动
         root.addWidget(self._table, stretch=3)
 
         # 日志区(只读; 上限防长会话内存增长)。
@@ -372,6 +387,7 @@ class MainWindow(QMainWindow):
         if not w_jars:
             self._engine = self._graph = self._executor = None
             self._ensure_panel()       # 画框随图拆除
+            self._tree.set_graph(None, res.jars)  # v0.3 树随空图回空态
             self._build_reverse_adj()
             self._refresh_table()
             self._refresh_indicators()
@@ -389,6 +405,7 @@ class MainWindow(QMainWindow):
         self._executor = Executor(res.jars, self._cfg)
         self._engine = None  # 全新扫描 → 会话未开始
         self._ensure_panel()          # 画框换血(新图新 jar 集)
+        self._tree.set_graph(self._graph, res.jars)  # v0.3 树换血(常驻对象注入新图)
         self._build_reverse_adj()     # 级联缓存重建
         self._ignored_missing.clear() # 新扫描重置修补忽视表(目录可能已换)
         self._refresh_table()
@@ -429,6 +446,7 @@ class MainWindow(QMainWindow):
         self._dir_edit.setText(rr.scan.mods_dir)
         self._watcher_teardown()
         self._ensure_panel()       # 画框随新图换血
+        self._tree.set_graph(self._graph, rr.scan.jars)  # v0.3 树换血
         self._build_reverse_adj()  # 级联缓存重建(忽视表保留: 同会话延续)
         self._refresh_table()
         self._refresh_indicators()
@@ -500,6 +518,8 @@ class MainWindow(QMainWindow):
         header.setSortIndicator(sort_col, sort_order)  # 重放用户当前排序
         if self._panel is not None and self._panel.isVisible():
             self._panel.refresh()  # 画框状态同步(启停变化后)
+        if self._tree is not None:
+            self._tree.refresh()  # v0.3 左树状态着色同步(启停变化后)
 
     # ---------------------------------------------------------------- 依赖画框
 
@@ -557,6 +577,27 @@ class MainWindow(QMainWindow):
                     out.add(nxt)
                     frontier.append(nxt)
         return out
+
+    # ---------------------------------------------------------------- 左树联动(v0.3)
+
+    def _on_table_selection(self) -> None:
+        """选中行变化(单击/键盘移动) → 左树联动渲染该 jar 的依赖树。
+
+        只读联动: 不碰状态机/不弹画框; 行身份恒由状态列携带。
+        全量重建表格会清空选中 → 空选中直接返回(树内容不变,
+        状态刷新由 _refresh_table 末尾的 tree.refresh() 兜底)。
+        """
+        if self._tree is None:
+            return
+        sel = self._table.selectionModel().selectedRows()
+        if not sel:
+            return
+        it = self._table.item(sel[0].row(), 0)
+        if it is None:
+            return
+        base = it.data(_JAR_ROLE)
+        if base:
+            self._tree.show_for(base)
 
     def _on_cell_double(self, row: int, col: int) -> None:
         """双击分发: 状态列 = 级联启停(需求 3); 其他列 = 依赖画框(需求 4)。"""

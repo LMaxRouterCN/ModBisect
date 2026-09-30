@@ -139,6 +139,8 @@ def main() -> int:
         check("列可拖动(列序持久化前提)", hh.sectionsMovable())
         check("右列判决组隐藏", not win._btn_judge_present.isVisible())
         check("调试按钮门控(非 wait_launch 禁)", not win._btn_debug.isEnabled())
+        check("左树空态(v0.3)", win._tree._title.text() == "依赖树"
+              and win._tree._up_tree.topLevelItemCount() == 0)
 
         # ---- 2. 扫描(m3 依赖 m0: 级联场景) ----
         mods = os.path.join(tmp, "mods")
@@ -163,6 +165,28 @@ def main() -> int:
                  for r in range(win._table.rowCount())]
         check("默认名称拼音升序", order == [f"m{i}.jar" for i in range(8)],
               str(order))
+        # ---- 3.5 左树联动(v0.3): selectRow 走真实信号链 ----
+        t = win._tree
+        win._table.selectRow(_row_of(win, "m0.jar"))
+        app.processEvents()
+        check("单击选中联动左树", "mod0" in t._title.text())
+        up_texts = [t._up_tree.topLevelItem(k).text(0)
+                    for k in range(t._up_tree.topLevelItemCount())]
+        check("m0 上树=依赖它的 m3", len(up_texts) == 1 and "mod3" in up_texts[0],
+              str(up_texts))
+        check("m0 下树=无依赖", t._down_tree.topLevelItemCount() == 1
+              and "无" in t._down_tree.topLevelItem(0).text(0))
+        win._table.selectRow(_row_of(win, "m3.jar"))
+        app.processEvents()
+        check("m3 下树=依赖 m0", t._down_tree.topLevelItemCount() == 1
+              and "mod0" in t._down_tree.topLevelItem(0).text(0))
+        check("m3 上树=无人依赖", t._up_tree.topLevelItemCount() == 1
+              and "无" in t._up_tree.topLevelItem(0).text(0))
+        # 树内容不随未选中的级联操作改变(只读联动)
+        # (m3 行仍选中: 下树 m0 应显示 [启用])
+        down_text = t._down_tree.topLevelItem(0).text(0)
+        check("m3 下树 m0 状态=启用", "启用" in down_text, down_text)
+
         # ---- 4. 级联禁用: 双击 m0 状态格(m3 依赖 mod0 → 陪葬) ----
         print("[smoke] 双击级联开关…")
         win._on_cell_double(_row_of(win, "m0.jar"), 0)
@@ -183,6 +207,12 @@ def main() -> int:
         win._on_cell_double(_row_of(win, "m0.jar"), 0)
         _wait_state(win, "ready", 5.0)
         check("级联启用拉起依赖者", _disabled_on_disk(mods) == [])
+        # v0.3: 级联开关后树状态同步(refresh 事件链;
+        # 就地突变与 watcher rescan 两时序分支同构收敛于"启用")
+        app.processEvents()
+        it0 = t._down_tree.topLevelItem(0)
+        check("级联后树状态同步=启用", it0 is not None and "启用" in it0.text(0),
+              (it0.text(0) if it0 is not None else "EMPTY"))
 
         # ---- 7. 依赖画框: 双击名称列展开 / 再点收起 ----
         win._on_cell_double(_row_of(win, "m0.jar"), 1)
