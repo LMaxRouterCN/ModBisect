@@ -224,28 +224,70 @@ class BisectEngine:
                 suspects=self.suspects,
             )
         if self.phase is Phase.OBSTRUCT:
-            # 可测性轮(v0.5): 最近可测态 + 试探禁用候选池后半(闭包扩张)
+            # 可测性轮(v0.5): 最近可测态 + 试探禁用候选(闭包扩张)。
+            # v0.5.1 全拖活锁修: 探针必须使预报命中为池的非空真子集
+            # (两答案均严格缩池, 终止性构造保证)。否则 UNTESTABLE 归算
+            # pool∩hit=pool 零收缩, 而下轮 sorted(pool) 确定性重选同一
+            # 探针 → 永久循环(线上: 池恒3/禁2 空转)。
+            # 预报与执行后归算同构: 实际禁用 = closure(base|probe) − frozen,
+            # 而 frozen∩pool=∅ → 池内命中不受 frozen 影响。
+            # 单调性: 探针变大 ⟹ 预报命中变大; 禁任一池单元 u 必命中 u 自身
+            # (H(u)⊇{u}), 故 |池|≥2 时单点扫描必得合法探针 —— 若每个单点
+            # 都全拖, 则池内单元两两互达 → 同一 SCC, 与单元划分矛盾。
+            # 补集半侧梯级经证明冗余(其合法 ⟹ 内部单点合法)裁撤,
+            # 梯子两层: 标准半探 → 单点扫描。
             ob = self._obstruct
             assert ob is not None
             ordered = sorted(ob.pool)
-            half = ordered[len(ordered) // 2:]
-            half_jars: set[str] = set()
             cand: set[str] = set()
             for i in ordered:
                 cand |= self.graph.units[i]
-                if i in half:
-                    half_jars |= self.graph.units[i]
-            # 子轮目标 = 上一可测配置 + 试探半侧(闭包扩张); 冻结恒钉启用
-            eff = self.graph.closure(ob.base_actual | half_jars,
+
+            def _forecast(pu: frozenset[int]) -> frozenset[int]:
+                """试探单元集 → 预报命中池的单元集(与 UNTESTABLE 归算同构)。"""
+                jars: set[str] = set()
+                for i in pu:
+                    jars |= self.graph.units[i]
+                eff2 = self.graph.closure(ob.base_actual | jars,
+                                          set(self.universe))
+                return frozenset(
+                    self.graph.unit_of[j] for j in eff2
+                    if j in self.graph.unit_of) & ob.pool
+
+            probe: frozenset[int] | None = None
+            degraded = False
+            if len(ordered) == 1:
+                probe = frozenset(ordered)  # 终局确认轮: 两答案走冻结/矛盾出口
+            else:
+                half = frozenset(ordered[len(ordered) // 2:])
+                if _forecast(half) < ob.pool:  # 真子集 → 标准半探可用
+                    probe = half
+                else:
+                    # 半侧全拖(依赖链拖住补集): 逐单点找合法探针(可证必达)
+                    for u in ordered:
+                        single = frozenset({u})
+                        if _forecast(single) < ob.pool:
+                            probe = single
+                            degraded = True
+                            break
+                assert probe is not None  # |池|≥2 存在性已证(见分支头注释)
+            probe_jars: set[str] = set()
+            for i in probe:
+                probe_jars |= self.graph.units[i]
+            # 子轮目标 = 上一可测配置 + 试探侧(闭包扩张); 冻结恒钉启用
+            eff = self.graph.closure(ob.base_actual | probe_jars,
                                      set(self.universe))
             target = (self.universe - eff) | self._frozen
+            prompt = (f"可测性轮: 额外禁用 {len(probe_jars)} 个阻碍候选"
+                      f"(池剩 {len(ob.pool)} 组), 游戏能否正常启动并观察?")
+            if degraded:
+                prompt += "(依赖链限制切分, 已改用单点试探)"
             return RoundPlan(
                 index=self._round_index + 1,
                 phase=Phase.OBSTRUCT,
-                prompt=(f"可测性轮: 额外禁用 {len(half_jars)} 个阻碍候选"
-                        f"(池剩 {len(ob.pool)} 组), 游戏能否正常启动并观察?"),
+                prompt=prompt,
                 target_enabled=target,
-                proposed_disabled=frozenset(half_jars),
+                proposed_disabled=frozenset(probe_jars),
                 suspects=frozenset(cand),
             )
 

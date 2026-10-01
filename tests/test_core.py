@@ -742,6 +742,76 @@ def test_engine_obstruct(graph: DependencyGraph) -> None:
           and e2.phase is Phase.OBSTRUCT)
 
 
+def test_engine_obstruct_degenerate(cfg: AppConfig) -> None:
+    """v0.5.1 全拖活锁修: 半探经依赖链拖住补集 → plan 期预报拦截降级单点。
+
+    场景1(链式): a 依赖 b,c, 池={a},{b},{c}三单元, 半探{b,c}闭包全拖 a
+    → 预报=全池(旧代码在此活锁) → 梯子改单点{a};
+    UNTESTABLE 冻结 a 回二分 / TESTABLE 剔 a 续子流程且回标准半探。
+    场景2(对): a 依赖 b, |池|=2, 半探{b}全拖 a → 单点{a} → 冻结直达验证。
+    """
+    from modbisect.model import Dependency, JarInfo, ModInfo
+
+    def _mk(base: str, deps: list[str]) -> JarInfo:
+        return JarInfo(
+            directory="", base_name=base, enabled=True, size=1,
+            mods=[ModInfo(modid="mod_" + base[:-4], display_name=base,
+                          version="1",
+                          dependencies=[Dependency(modid="mod_" + d,
+                                                   mandatory=True)
+                                        for d in deps])])
+
+    # --- 场景1: 链式 a→{b,c} ---
+    g = DependencyGraph([_mk("a.jar", ["b", "c"]), _mk("b.jar", []),
+                         _mk("c.jar", [])], cfg.ignore_modids)
+    check("1 三独立单元", len(g.units) == 3)
+    e = BisectEngine(g)
+    e.report(Answer.PRESENT, frozenset())  # 基准复现
+    p1 = e.current_plan
+    e.report(Answer.UNTESTED,
+             frozenset(g.universe - set(p1.target_enabled)))
+    p2 = e.current_plan
+    check("1 半探全拖改单点a", p2.phase is Phase.OBSTRUCT
+          and set(p2.proposed_disabled) == {"a.jar"}
+          and "单点试探" in p2.prompt)
+    a = e.report(Answer.UNTESTABLE, frozenset(g.closure(
+        set(p2.proposed_disabled), set(g.universe))))
+    check("1 单点不可测冻结a回二分", a is Action.NEXT_PLAN
+          and e.frozen == frozenset({"a.jar"}) and e.phase is Phase.BISECT)
+    check("1 冻结剔除嫌疑", e.suspects == frozenset({"b.jar", "c.jar"}))
+    e2 = BisectEngine(g)
+    e2.report(Answer.PRESENT, frozenset())
+    p1 = e2.current_plan
+    e2.report(Answer.UNTESTED,
+              frozenset(g.universe - set(p1.target_enabled)))
+    p2 = e2.current_plan
+    a = e2.report(Answer.TESTABLE, frozenset(g.closure(
+        set(p2.proposed_disabled), set(g.universe))))
+    check("1 单点可测剔a续子流程", a is Action.NEXT_PLAN
+          and e2.phase is Phase.OBSTRUCT)
+    p3 = e2.current_plan
+    check("1 续轮回标准半探", set(p3.proposed_disabled) == {"c.jar"}
+          and "单点试探" not in p3.prompt)
+
+    # --- 场景2: 对 a→b, |池|=2(线上活锁形态) ---
+    g = DependencyGraph([_mk("a.jar", ["b"]), _mk("b.jar", [])],
+                        cfg.ignore_modids)
+    check("2 两单元", len(g.units) == 2)
+    e = BisectEngine(g)
+    e.report(Answer.PRESENT, frozenset())
+    p1 = e.current_plan
+    e.report(Answer.UNTESTED,
+             frozenset(g.universe - set(p1.target_enabled)))
+    p = e.current_plan
+    check("2 半探全拖改单点a", p.phase is Phase.OBSTRUCT
+          and set(p.proposed_disabled) == {"a.jar"}
+          and "单点试探" in p.prompt)
+    a = e.report(Answer.UNTESTABLE, frozenset(g.closure(
+        set(p.proposed_disabled), set(g.universe))))
+    check("2 冻结a直达验证", a is Action.NEXT_PLAN
+          and e.phase is Phase.VERIFY and e.suspects == frozenset({"b.jar"}))
+
+
 # ---------------------------------------------------------------- main
 
 def main() -> int:
@@ -756,6 +826,7 @@ def main() -> int:
         test_engine_branches(graph, W)
         test_engine_scan(graph)
         test_engine_obstruct(graph)
+        test_engine_obstruct_degenerate(cfg)
         test_executor(res2, cfg)
         test_session(tmp, cfg)
         test_sortkey()
