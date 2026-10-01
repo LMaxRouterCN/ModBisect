@@ -31,6 +31,8 @@ import time
 import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# [长期记忆: 017] Windows 控制台 GBK 兜底: 中文输出防 UnicodeEncodeError
+sys.stdout.reconfigure(encoding="utf-8")
 # offscreen 必须先于任何 Qt 导入
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -154,6 +156,8 @@ def main() -> int:
         check("列可拖动(列序持久化前提)", hh.sectionsMovable())
         check("右列判决组隐藏", not win._btn_judge_present.isVisible())
         check("调试按钮门控(非 wait_launch 禁)", not win._btn_debug.isEnabled())
+        check("冻结/解冻门控(IDLE 禁)", not win._btn_freeze.isEnabled()
+              and not win._btn_unfreeze.isEnabled())
         check("左树空态(v0.3)", win._tree._title.text() == "依赖树"
               and win._tree._up_tree.topLevelItemCount() == 0)
 
@@ -278,6 +282,8 @@ def main() -> int:
                   for n in os.listdir(session_mod.SESSIONS_DIR)))
         check("watcher 已武装", win._watcher is not None)
         check("调试按钮可用(wait_launch)", win._btn_debug.isEnabled())
+        check("冻结/解冻可用(wait_launch)", win._btn_freeze.isEnabled()
+              and win._btn_unfreeze.isEnabled())
 
         # ---- 10. 仿真游戏生命周期 → 右列判决(非模态) ----
         print("[smoke] 仿真启动→退出→右列判决…")
@@ -285,11 +291,37 @@ def main() -> int:
         check("进入 WAIT_GAME", win._state.value == "wait_game")
         check("procmon 跟踪中", win._procmon is not None
               and win._procmon.tracking)
+        # v0.5.2: WAIT_GAME 冻结 = 纯记录(JVM 锁盘, 不动盘面, 下轮修正)
+        win._table.selectRow(_row_of(win, "m3.jar"))
+        app.processEvents()
+        win._on_freeze()
+        app.processEvents()
+        check("WAIT_GAME 冻结纯记录", win._state.value == "wait_game"
+              and win._engine.frozen == frozenset({"m3.jar"})
+              and _disabled_on_disk(mods) == [])
+        win._on_unfreeze()
+        app.processEvents()
+        check("WAIT_GAME 解冻复原嫌疑",
+              win._engine.frozen == frozenset()
+              and set(win._engine.suspects) == set(win._engine.universe))
         win._procmon.game_exited.emit()  # 模拟进程监控的退出信号
         check("进入 JUDGING(非模态)", win._state.value == "judging")
         check("判决组按钮可见", win._btn_judge_present.isVisible()
               and win._btn_judge_absent.isVisible())
         check("SKIP 仅基准轮可见", win._btn_judge_skip.isVisible())
+        # v0.5.2: JUDGING 冻结 → 后台复原钉启用+刷新归算基准; 解冻纯状态还原
+        win._on_freeze()  # 选中仍是 m3 行(WAIT_GAME 块确立)
+        _wait_status(win, "冻结复原完成", 5.0)
+        check("JUDGING 冻结复原完成", win._apply_busy is False
+              and win._engine.frozen == frozenset({"m3.jar"})
+              and win._state.value == "judging")
+        check("JUDGING 归算基准已刷新", win._last_report is not None
+              and win._last_report.ok)
+        win._on_unfreeze()
+        app.processEvents()
+        check("JUDGING 解冻还原嫌疑",
+              win._engine.frozen == frozenset()
+              and set(win._engine.suspects) == set(win._engine.universe))
         win._on_judge_present()  # 右列按钮: 问题还在(基准轮确认复现)
         _wait_state(win, "wait_launch", 10.0)
         check("二分轮 1 WAIT_LAUNCH", win._state.value == "wait_launch")
@@ -306,6 +338,21 @@ def main() -> int:
         _wait_state(win, "wait_launch", 10.0)
         dis = _disabled_on_disk(mods)
         check("二分轮 2 禁 2 个", len(dis) == 2, str(dis))
+        # v0.5.2: WAIT_LAUNCH 冻结被禁目标 → 重开轮, apply 顺带改回启用
+        win._table.selectRow(_row_of(win, "m3.jar"))
+        app.processEvents()
+        win._on_freeze()
+        _wait_state(win, "wait_launch", 10.0)
+        dis = _disabled_on_disk(mods)
+        check("冻结重开轮钉回启用", win._state.value == "wait_launch"
+              and win._engine.frozen == frozenset({"m3.jar"})
+              and "m3.jar.disabled" not in dis and len(dis) == 2, str(dis))
+        check("冻结剔除嫌疑", win._engine.suspect_count == 3)
+        win._on_unfreeze()
+        _wait_state(win, "wait_launch", 10.0)
+        dis = _disabled_on_disk(mods)
+        check("解冻重开轮复原嫌疑", win._engine.suspect_count == 4
+              and len(dis) == 2, str(dis))
 
         # ---- 12. 全链走完: 轮 3 → 验证轮 → 确诊终局 ----
         # 终局弹窗替身: 模拟"保持当前状态"(restore_requested=False)
@@ -330,6 +377,8 @@ def main() -> int:
         app.processEvents()
         check("全链终局收尾 READY", win._state.value == "ready")
         check("终局后引擎清空", win._engine is None)
+        check("终局后冻结/解冻禁用", not win._btn_freeze.isEnabled()
+              and not win._btn_unfreeze.isEnabled())
         check("确诊报告入日志", "确诊" in win._log_view.toPlainText())
         del VerdictDialog.exec
 

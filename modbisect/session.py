@@ -22,7 +22,7 @@ from .depgraph import DependencyGraph
 from .engine import Answer, BisectEngine, ScanSpec
 from .scanner import ScanResult, scan_mods_dir
 
-SESSION_VERSION = 2  # v0.4: +scan_spec(卷帘规格); v1 旧会话仍可恢复
+SESSION_VERSION = 3  # v0.5.2: history 加 kind/jars(手动冻结显式事件); v1/v2 旧会话仍可恢复
 
 
 @dataclass
@@ -33,6 +33,21 @@ class RestoreResult:
     scan: ScanResult | None = None
     graph: DependencyGraph | None = None
     engine: BisectEngine | None = None
+
+
+def _record_item(r) -> dict:
+    """RoundRecord → 会话 JSON 项(v0.5.2: kind/jars 显式事件)。"""
+    item = {
+        "answer": r.answer,
+        "disabled": sorted(r.actual_disabled),
+        # 崩溃轮 answer 恒为 "invalid"; 显式冗余存 crashed 提高前向兼容性
+        "crashed": r.answer == "invalid",
+        "kind": r.kind,
+    }
+    if r.kind != "round":
+        # 手动冻结/解冻事件: 附 jar 集, 重放时直接调引擎公共体
+        item["jars"] = sorted(r.jars)
+    return item
 
 
 def save_session(scan: ScanResult, engine: BisectEngine) -> str | None:
@@ -50,13 +65,9 @@ def save_session(scan: ScanResult, engine: BisectEngine) -> str | None:
                  "enabled": j.base_name in engine.universe}
                 for j in scan.jars
             ],
+            # v0.5.2: 每条记录带 kind(round/freeze/unfreeze); 手动事件附 jars
             "history": [
-                {
-                    "answer": r.answer,
-                    "disabled": sorted(r.actual_disabled),
-                    # 崩溃轮 answer 恒为 "invalid"; 显式冗余存 crashed 提高前向兼容性
-                    "crashed": r.answer == "invalid",
-                }
+                _record_item(r)
                 for r in engine.history
             ],
         # v0.4: 卷帘规格(仅卷帘会话存在; 恢复时重建 ScanSpec 再重放,
@@ -116,7 +127,7 @@ def restore_session(path: str, cfg: AppConfig) -> RestoreResult:
             data = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
         return RestoreResult(ok=False, reason=f"会话文件不可读: {e}")
-    if data.get("version") not in (1, SESSION_VERSION):
+    if data.get("version") not in (1, 2, SESSION_VERSION):
         return RestoreResult(ok=False, reason="会话版本不兼容")
 
     # 重扫当前目录(当前启停态可以与会话不同: 中断时正处于二分中间态)
@@ -152,8 +163,18 @@ def restore_session(path: str, cfg: AppConfig) -> RestoreResult:
                         from_top=bool(sd.get("from_top", True)))
     engine = BisectEngine(graph, spec)
 
-    # 重放历史: 纯状态转移, 确定性重建中断前状态
+    # 重放历史: 纯状态转移 + 显式事件, 确定性重建中断前状态
     for rec in data.get("history", []):
+        # v0.5.2: 手动冻结/解冻 = 自由意志显式事件, 不可由 report 推导,
+        # 直接调引擎公共体重放(记账 _frozen_was_suspect 随之确定式重建)
+        kind = rec.get("kind", "round")
+        if kind in ("freeze", "unfreeze"):
+            jars = frozenset(rec.get("jars", []))
+            if kind == "freeze":
+                engine.freeze(jars)
+            else:
+                engine.unfreeze(jars)
+            continue
         crashed = bool(rec.get("crashed")) or rec.get("answer") == "invalid"
         # 崩溃轮的 answer 字段值无意义("invalid" 非 Answer 成员), 填什么都被 crashed 分支忽略
         answer = Answer.PRESENT if crashed else Answer(rec.get("answer", ""))

@@ -79,10 +79,19 @@ class RoundPlan:
 
 @dataclass
 class RoundRecord:
-    """历史归档(会话持久化/复盘用)。"""
-    plan: RoundPlan
+    """历史归档(会话持久化/复盘用)。
+
+    v0.5.2: 记录统一入账(kind 字段区分):
+    - "round": 测试轮(plan/answer/actual_disabled 有效);
+    - "freeze"/"unfreeze": 手动冻结/解冻的显式事件(自由意志不可由
+      状态推导, 会话重放据此直接调用 freeze/unfreeze 重建)。
+      此时 plan=None, jars = 本次操作的 jar 集(整单元成员)。
+    """
+    plan: RoundPlan | None
     answer: str                        # 玩家回答("invalid" = 崩溃作废轮)
     actual_disabled: frozenset[str]    # 执行层回报的实际生效禁用集
+    kind: str = "round"                # 记录类型: round / freeze / unfreeze
+    jars: frozenset[str] = frozenset() # 手动事件的 jar 集(仅 freeze/unfreeze)
 
 
 @dataclass
@@ -141,6 +150,12 @@ class BisectEngine:
         self.history: list[RoundRecord] = []
         self.verdict: Verdict | None = None
         self._frozen: frozenset[str] = frozenset()  # 阻碍集(v0.5): 恒钉启用
+        # v0.5.2 手动冻结记账: 冻结时仍在嫌疑池的单元索引(解冻按此恢复资格)
+        self._frozen_was_suspect: set[int] = set()
+        # v0.5.2 冻结排空结案标志: True 时 DONE 可被 unfreeze 撤销回主流程
+        self._frozen_drained = False
+        # v0.5.2 冻结排空时的相位存档(解冻撤回结案时恢复到冻结前相位)
+        self._frozen_drain_phase = Phase.BASELINE
         self._obstruct: _ObstructState | None = None  # 可测性子二分进行态
 
     # -------------------------------------------------- 展示辅助(只读)
@@ -313,6 +328,105 @@ class BisectEngine:
         )
 
     # -------------------------------------------------- 状态推进
+
+    # -------------------------------------------------- 手动冻结/解冻(v0.5.2)
+
+    def freeze(self, bases: frozenset[str]) -> frozenset[str]:
+        """手动冻结(单元粒度): 恒钉启用, 移出嫌疑与调度, 显式事件入史。
+
+        返回实际新冻结的 jar 集(整单元成员); 空 = 无事发生
+        (输入不在 W / 已全部冻结 / 非法相位)。
+        非法相位: OBSTRUCT(可测性子二分维护 frozen∩pool=∅ 不变量,
+        手动插入会假排除候选)与 DONE(唯一例外: 撤销冻结排空的 unfreeze)。
+        冻结时仍在嫌疑池的单元记入 _frozen_was_suspect(解冻对称恢复);
+        嫌疑池被冻空 = 结案(verdict「嫌疑被冻结排空」, 与自动路径同款)。
+        """
+        return self._manual_freeze(bases, "freeze")
+
+    def unfreeze(self, bases: frozenset[str]) -> frozenset[str]:
+        """手动解冻(冻结的对称撤销): 纯状态开关, 不动盘面。
+
+        仅恢复解冻时原属嫌疑池的单元(_frozen_was_suspect 记账);
+        会话若因「冻结排空」结案(_frozen_drained), 解冻使嫌疑池复活时
+        撤销结案, 恢复到冻结前相位继续推理(单单元经
+        _enter_next_phase_or_verify 自动转 VERIFY)。
+        """
+        return self._manual_freeze(bases, "unfreeze")
+
+    def _manual_freeze(self, bases: frozenset[str],
+                       kind: str) -> frozenset[str]:
+        """freeze/unfreeze 公共体: 门禁 → 单元提升 → 记账 → 显式事件。
+
+        单元粒度: 依赖互锁的 jar 绑成单元(SCC), 半冻单元 = 物理禁态,
+        故输入按 unit_of 提升后整单元操作, 返回/入史同为整单元成员。
+        """
+        # 门禁: OBSTRUCT 全拒; DONE 仅允许撤销「冻结排空」的解冻
+        if self.phase is Phase.OBSTRUCT:
+            return frozenset()
+        if self.phase is Phase.DONE and not (
+                kind == "unfreeze" and self._frozen_drained):
+            return frozenset()
+        # 输入过滤: 只认 W 域内成员, 提升到绑定单元
+        want: set[int] = set()
+        for b in bases:
+            if b in self.universe and b in self.graph.unit_of:
+                want.add(self.graph.unit_of[b])
+        if kind == "freeze":
+            # 幂等: 已冻单元剔除(重复冻结 = 空操作)
+            want -= {self.graph.unit_of[b] for b in self._frozen}
+            if not want:
+                return frozenset()
+            new_jars = frozenset(
+                j for i in want for j in self.graph.units[i])  # 整单元成员
+            # 嫌疑池记账: 冻结时仍在池内的单元, 解冻时按此恢复资格
+            for i in want:
+                if i in self._suspect_units:
+                    self._frozen_was_suspect.add(i)
+            self._frozen |= new_jars
+            self._suspect_units -= want
+            # 冻空嫌疑池: 罪魁可能就在冻结集(用户冻结 = 自担排除判断)
+            if not self._suspect_units:
+                self._frozen_drain_phase = self.phase  # 撤回时恢复相位
+                self._frozen_drained = True
+                self.verdict = Verdict(
+                    title="嫌疑被冻结排空",
+                    detail="全部嫌疑 mod 均被手动冻结排除。罪魁可能就在"
+                           "冻结集: " + ", ".join(sorted(self._frozen))
+                           + "\n(冻结 = 恒启用钉死, 不参与开关二分)\n"
+                           "建议: 人工核查上述 mod, 或解冻部分后继续排查。")
+                self.phase = Phase.DONE
+            touched = set(new_jars)
+        else:
+            # 幂等: 未冻单元剔除(解冻未冻结项 = 空操作)
+            want &= {self.graph.unit_of[b] for b in self._frozen}
+            if not want:
+                return frozenset()
+            gone = frozenset(j for i in want for j in self.graph.units[i])
+            # 嫌疑资格恢复: 仅原属嫌疑池的单元回池(对称还原冻结动作)
+            back = want & self._frozen_was_suspect
+            self._frozen -= gone
+            self._frozen_was_suspect -= want
+            self._suspect_units |= back
+            if back:
+                # 冻结排空结案被撤销: 会话复活, 恢复到冻结前相位继续推理
+                self.verdict = None
+                if self._frozen_drained:
+                    # 仅排空结案场景恢复存档相位; 非排空解冻不动当前相位
+                    self.phase = self._frozen_drain_phase
+                    self._frozen_drained = False
+                # 单元数重判: 单单元转 VERIFY; 多单元滞留 VERIFY 退回二分
+                if len(self._suspect_units) == 1:
+                    self.phase = Phase.VERIFY
+                elif (len(self._suspect_units) > 1
+                      and self.phase is Phase.VERIFY):
+                    self.phase = Phase.BISECT
+            touched = set(gone)
+        # 轮次号不推进: 手动冻结/解冻不是测试轮, 不吃 plan.index 计数
+        # 显式事件: 自由意志不可由状态推导, kind/jars 全量入史供重放
+        self.history.append(RoundRecord(
+            plan=None, answer="", actual_disabled=frozenset(),
+            kind=kind, jars=frozenset(touched)))
+        return frozenset(touched)
 
     def report(self, answer: Answer,
                actual_disabled: frozenset[str],
@@ -539,6 +653,9 @@ class BisectEngine:
         if len(after) == 1:
             # 唯一候选 = 阻碍单元: 冻结(钉启用) + 双剔除, 回主流程
             idx = next(iter(after))
+            # v0.5.2 嫌疑池记账: 自动冻结同样入账, 手动解冻可对称恢复
+            if idx in self._suspect_units:
+                self._frozen_was_suspect.add(idx)
             self._frozen = self._frozen | self.graph.units[idx]
             self._obstruct = None
             after_s = self._suspect_units - {idx}

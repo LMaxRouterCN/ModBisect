@@ -123,6 +123,7 @@ class MainWindow(QMainWindow):
         self._current_plan = None                   # 本轮计划(提示/判决按钮用)
         self._last_report: ApplyReport | None = None
         self._crash_flag = False                    # 本轮内是否见过崩溃文件
+        self._pending_finish = False  # v0.5.2: 冻结排空结案待游戏退出后收尾
         self._state = UiState.IDLE
         self._workers: set[_Worker] = set()         # 在途任务引用(完成自摘)
 
@@ -279,6 +280,19 @@ class MainWindow(QMainWindow):
         self._btn_debug.setToolTip("调试: 跳过真实启动/退出, 直接进入本轮判决")
         self._btn_debug.clicked.connect(self._on_debug_fake_game)
         side.addWidget(self._btn_debug)
+        # v0.5.2 手动冻结/解冻: 单元粒度, 测试全程可用(OBSTRUCT 相位除外)
+        self._btn_freeze = QPushButton("冻结选中\n(恒启用, 退出嫌疑)")
+        self._btn_freeze.setToolTip(
+            "选中行整单元冻结: 钉死启用并移出嫌疑与调度;\n"
+            "冻空嫌疑池则结案(罪魁可能在冻结集, 自担判断)")
+        self._btn_freeze.clicked.connect(self._on_freeze)
+        side.addWidget(self._btn_freeze)
+        self._btn_unfreeze = QPushButton("解冻选中\n(恢复嫌疑资格)")
+        self._btn_unfreeze.setToolTip(
+            "冻结的对称撤销: 恢复原属嫌疑池的单元, 不动盘面;\n"
+            "若会话已因冻结排空结案, 解冻即撤销结案继续推理")
+        self._btn_unfreeze.clicked.connect(self._on_unfreeze)
+        side.addWidget(self._btn_unfreeze)
         side.addStretch(1)  # 判决组沉底(视觉与"轮次进行"区隔)
         # 判决组(需求 7: 替代原模态弹窗, 仅 JUDGING 态显示)
         self._btn_judge_present = QPushButton("问题还在\n(出在当前启用的里)")
@@ -344,6 +358,15 @@ class MainWindow(QMainWindow):
         self._btn_snap_restore.setEnabled(s in idle_like and self._scan is not None)
         # 调试直通: 仅等待启动态(WAIT_GAME 走 procmon 真实路径)
         self._btn_debug.setEnabled(s is UiState.WAIT_LAUNCH)
+        # v0.5.2 手动冻结/解冻: 测试三窗口可用; OBSTRUCT 相位拒绝
+        # (可测性子二分维护 frozen∩pool=∅ 不变量, 手动插入会假排除候选)
+        manual_ok = (s in (UiState.WAIT_LAUNCH, UiState.WAIT_GAME,
+                           UiState.JUDGING)
+                     and self._engine is not None
+                     and self._current_plan is not None
+                     and self._current_plan.phase is not Phase.OBSTRUCT)
+        self._btn_freeze.setEnabled(manual_ok)
+        self._btn_unfreeze.setEnabled(manual_ok)
         # 判决组: 仅 JUDGING 可见; 跳过按钮再限基准轮(引擎侧另有二次防御)
         judging = s is UiState.JUDGING
         for b in (self._btn_judge_present, self._btn_judge_absent,
@@ -948,12 +971,16 @@ class MainWindow(QMainWindow):
 
     def _on_judge_retest(self) -> None:
         """本轮作废: 引擎不推进, 同计划幂等重走(磁盘已是目标态, 零改名)。"""
+        if self._apply_busy:  # v0.5.2: 冻结复原在途, 禁重走(防并发 apply)
+            return
         if self._state is not UiState.JUDGING:
             return
         self._log("[轮] 本轮作废, 重新测试")
         self._begin_round()
 
     def _submit_answer(self, answer) -> None:
+        if self._apply_busy:  # v0.5.2: 冻结复原在途, 禁作答(归算基准未定)
+            return
         if self._state is not UiState.JUDGING:
             return
         # 用户在崩溃警告下仍作答 = 用户自主确认本轮信号有效
@@ -980,6 +1007,84 @@ class MainWindow(QMainWindow):
             return
         self._log("[调试] 跳过游戏启动, 直接进入判决")
         self._enter_judging()
+
+    # -------------------------------------------------- 手动冻结/解冻(v0.5.2)
+
+    def _manual_toggle(self, kind: str) -> None:
+        """冻结/解冻公共入口: 引擎记账 + 显式事件入史 + 状态分流。
+
+        冻结: 单元粒度钉死启用; 本轮被禁的选中目标按窗口修正盘面:
+        - WAIT_LAUNCH: 重开轮, apply 顺带改回启用(diff 通路零额外机器);
+        - WAIT_GAME: 只记状态(JVM 锁盘改不动, 下轮计划自然修正);
+        - JUDGING: 后台复原到 target∪frozen 并刷新归算基准(_last_report)。
+        解冻: 纯状态开关, 所有窗口都不动盘面(下轮 apply 自然吸收);
+        WAIT_LAUNCH 重开轮(嫌疑池已变, 旧计划作废, 重取给公平审判)。
+        冻空嫌疑池 = 结案: WAIT_GAME 延后到游戏退出(_pending_finish),
+        其余窗口立即 _finish。
+        """
+        if self._apply_busy or self._engine is None:
+            return
+        bases = frozenset(self._selected_bases())
+        if not bases:
+            return
+        touched = (self._engine.freeze(bases) if kind == "freeze"
+                   else self._engine.unfreeze(bases))
+        if not touched:
+            self._log(f"[{kind}] 无有效目标(不在工作域/状态不符/当前相位禁止)")
+            return
+        self._log(("[冻结] " if kind == "freeze" else "[解冻] ")
+                  + ", ".join(sorted(touched)))
+        self._refresh_table()
+        save_session(self._scan, self._engine)
+        self._after_manual(kind)
+
+    def _on_freeze(self) -> None:
+        self._manual_toggle("freeze")
+
+    def _on_unfreeze(self) -> None:
+        self._manual_toggle("unfreeze")
+
+    def _after_manual(self, kind: str) -> None:
+        """手动操作后的状态分流(引擎 phase 已更新, 盘面尚未动)。"""
+        if kind == "unfreeze":
+            # 结案被撤销(或作废) → 挂起收尾随之失效, 下方 DONE 分支重估
+            self._pending_finish = False
+        if self._engine.phase is Phase.DONE:
+            # 冻结排空结案(手冻版唯一 DONE 入口)
+            if self._state is UiState.WAIT_GAME:
+                self._pending_finish = True  # 游戏锁盘, 退出后再收尾
+                self._set_state(self._state, "嫌疑已冻空结案 — 游戏退出后出示报告")
+            else:
+                self._finish()
+            return
+        if self._state is UiState.WAIT_LAUNCH:
+            # 冻结/解冻都改变嫌疑池: 旧计划作废, 重开轮重取计划
+            # (冻结目标的盘面修正由本轮 apply 顺带完成, 零额外通路)
+            self._begin_round()
+            return
+        if self._state is UiState.JUDGING and kind == "freeze":
+            # 判决窗口冻结: 本轮被禁的冻结目标须改回启用(恒启用钉死),
+            # 完成后刷新归算基准(_last_report.actual 与盘面对齐)
+            self._apply_busy = True
+            self._set_state(self._state, "正在复原冻结目标为启用…")
+            self._spawn(self._executor.apply,
+                        frozenset(self._current_plan.target_enabled)
+                        | self._engine.frozen,
+                        on_done=self._on_manual_restore_done,
+                        on_fail=self._on_apply_fail)
+            return
+        # 其余(WAIT_GAME 纯记录 / JUDGING 解冻纯状态): 只刷状态行
+        self._set_state(self._state, "冻结/解冻已记录, 继续当前流程")
+
+    def _on_manual_restore_done(self, report: ApplyReport) -> None:
+        """判决窗口冻结复原完成: 刷新归算基准, 回判决态继续作答。"""
+        self._apply_busy = False  # 旗标先清(失败路径同样需要)
+        if not report.ok:
+            self._handle_apply_failure(report)
+            return
+        self._last_report = report  # v0.5.2 归算基准统一到 actual
+        self._refresh_table()
+        self._set_state(self._state, "冻结复原完成, 继续作答")
 
     # ---------------------------------------------------------------- 轮次循环
 
@@ -1091,6 +1196,7 @@ class MainWindow(QMainWindow):
             self._log(f"[错误] {e}")
         # 图/引擎/执行器全部失真 → 作废(表格保留展示)
         self._engine = self._graph = self._executor = None
+        self._pending_finish = False  # v0.5.2: 会话作废, 挂起结案作废
         self._watcher_teardown()
         self._refresh_indicators()
         self._set_state(UiState.READY, "启停失败, 会话已作废")
@@ -1129,6 +1235,10 @@ class MainWindow(QMainWindow):
 
     def _on_game_exited(self) -> None:
         if self._state is not UiState.WAIT_GAME:
+            return
+        if self._pending_finish:  # v0.5.2: 冻结排空结案延后到此刻收尾
+            self._pending_finish = False
+            self._finish()
             return
         self._enter_judging()  # 判决交右列按钮(非模态)
 
@@ -1182,6 +1292,7 @@ class MainWindow(QMainWindow):
         if self._procmon is not None:
             self._procmon.stop()  # 游戏若在跑, 线程在其退出后自行了结
         self._engine = None
+        self._pending_finish = False  # v0.5.2: 会话作废, 挂起结案作废
         if clicked is b_restore:
             self._set_state(UiState.APPLYING, "正在还原所有 mod…")
             self._spawn(self._executor.restore_initial,

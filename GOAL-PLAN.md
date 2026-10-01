@@ -232,3 +232,36 @@ pool∩hit=pool 零收缩, 而 plan 期 sorted(pool) 确定性重选同一探针
 
 **测试**: test_engine_obstruct_degenerate 双场景(链式 a→{b,c} 三
 单元 / 对 a→b 两单元=线上形态); 全量 154 通过 0 失败, 冒烟 90+0
+
+
+## v0.5.2 变更(手动冻结/解冻)
+
+**场景**: 自动冻结只认阻碍子流程判定; 用户已知某 mod 无辜(或要强排
+嫌疑)时没有通路 —— 需要手动"恒钉启用 + 移出调度与嫌疑"。
+
+**引擎**(freeze/unfreeze 公共体, 单元粒度):
+- 门禁: OBSTRUCT 拒绝(护 frozen∩pool=∅ 不变量); DONE 仅放行冻结排空
+  的解冻(撤销结案); freeze 幂等去重已冻单元, 空操作不入史
+- 显式事件入 history(kind/jars): 自由意志不可由 report 推导; 手动
+  事件不吃轮次号(非测试轮)
+- 资格对称: 冻结时仍在嫌疑池的单元记 _frozen_was_suspect(自动冻结
+  同样入账), 解冻按此回池 —— 非池解冻不回池
+- 冻空嫌疑池 → "嫌疑被冻结排空"结案(自担文案), 相位存档; 解冻复活:
+  恢复存档相位, 单单元转 VERIFY / 多单元滞留 VERIFY 退回 BISECT
+- 会话 v3: history 加 kind/jars; 重放 = report 推导 + 显式事件直调
+  混合(记账确定式重建); v1/v2 旧会话照常恢复
+
+**UI**(右列双钮, 测试三窗口可用, OBSTRUCT 相位禁):
+- 冻结分流: WAIT_LAUNCH 重开轮(apply 顺带钉回启用, 零额外通路);
+  WAIT_GAME 纯记录(JVM 锁盘改不动; 冻结单元已出池, 归算无影响);
+  JUDGING 后台复原 target∪frozen + 刷新归算基准 _last_report
+- 解冻: 纯状态开关不动盘面(下轮 apply 自然吸收); WAIT_LAUNCH 重开
+  轮重取计划(嫌疑池已变, 旧计划作废)
+- 冻结排空结案遇 WAIT_GAME → _pending_finish 延后到游戏退出;
+  abort/apply-failure 路径同清标志防残留
+- 并发守卫: _submit_answer / _on_judge_retest 顶部 _apply_busy 拦
+  (复原在途时归算基准未定)
+
+**测试**: test_core 手动冻结单元 A-F(粒度/事件/门禁/排空结案/资格
+对称/重放 roundtrip); smoke 三窗口冻结冒烟 + 门控; 全量 184 通过 0
+失败, 冒烟 101+0

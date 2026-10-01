@@ -17,6 +17,8 @@ import zipfile
 
 # 直接 python tests/test_core.py 运行时 sys.path[0]=tests/, 需补项目根
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# [长期记忆: 017] Windows 控制台 GBK 兜底: 中文输出防 UnicodeEncodeError
+sys.stdout.reconfigure(encoding="utf-8")
 
 from modbisect.config import AppConfig
 from modbisect.scanner import scan_mods_dir
@@ -812,6 +814,101 @@ def test_engine_obstruct_degenerate(cfg: AppConfig) -> None:
           and e.phase is Phase.VERIFY and e.suspects == frozenset({"b.jar"}))
 
 
+def test_engine_manual_freeze(graph: DependencyGraph,
+                              tmp: str, cfg: AppConfig) -> None:
+    """v0.5.2 手动冻结/解冻: 单元粒度/显式事件/门禁/排空结案/资格对称/重放。
+
+    场景沿用 build_graph_scene: W={w,x,y,z}, 单元 {w},{x,y}(SCC),{z}。
+    """
+    print("[engine: 手动冻结/解冻]")
+
+    # --- A: 基准后冻结(单元粒度 + 幂等 + 非W拒 + 显式事件) ---
+    e = BisectEngine(graph)
+    e.report(Answer.PRESENT, frozenset())  # 基准复现 → BISECT(全池)
+    f = e.freeze(frozenset({"x.jar", "ghost.jar"}))
+    check("A 单元粒度整冻SCC+非W拒", f == frozenset({"x.jar", "y.jar"}))
+    check("A 冻结集入位", e.frozen == frozenset({"x.jar", "y.jar"}))
+    check("A 嫌疑剔除单元", set(e.suspects) == {"w.jar", "z.jar"})
+    check("A 相位不越迁", e.phase is Phase.BISECT)
+    rec = e.history[-1]
+    check("A 显式事件入史", rec.kind == "freeze" and rec.plan is None
+          and set(rec.jars) == {"x.jar", "y.jar"})
+    check("A 重复冻幂等", e.freeze(frozenset({"y.jar"})) == frozenset()
+          and len([r for r in e.history if r.kind == "freeze"]) == 1)
+
+    # --- B: 计划绕开冻结 + 二分续走 ---
+    p = e.current_plan
+    check("B 计划绕开冻结", not (set(p.proposed_disabled) & e.frozen))
+    check("B 计划钉住冻结启用", e.frozen <= set(p.target_enabled))
+    actual = frozenset(graph.closure(set(p.proposed_disabled),
+                                     set(graph.universe)))
+    a = e.report(Answer.PRESENT, actual)
+    check("B 二分续走进验证", a is Action.NEXT_PLAN
+          and e.phase is Phase.VERIFY)
+
+    # --- C: 冻结排空结案 + DONE 门禁 + 解冻撤销结案 ---
+    f2 = e.freeze(frozenset({"w.jar"}))  # 验证轮冻掉唯一嫌疑 → 排空
+    check("C 冻结唯一嫌疑", f2 == frozenset({"w.jar"}))
+    check("C 排空结案", e.phase is Phase.DONE and e.verdict is not None
+          and "排空" in e.verdict.title)
+    check("C DONE禁冻结", e.freeze(frozenset({"z.jar"})) == frozenset())
+    u = e.unfreeze(frozenset({"w.jar", "z.jar"}))  # z 未冻剔除, w 恢复
+    check("C 解冻混合集只退w", u == frozenset({"w.jar"}))
+    check("C 结案撤销复活", e.verdict is None and e.phase is Phase.VERIFY
+          and set(e.suspects) == {"w.jar"})
+    check("C 解冻事件入史", e.history[-1].kind == "unfreeze"
+          and set(e.history[-1].jars) == {"w.jar"})
+
+    # --- D: 资格对称(池内记账回池) + 多单元滞留 VERIFY 退回二分 ---
+    u2 = e.unfreeze(frozenset({"x.jar"}))  # x,y 冻结时在池内(A 轮全池)
+    check("D 解冻整单元回池", u2 == frozenset({"x.jar", "y.jar"})
+          and set(e.suspects) == {"w.jar", "x.jar", "y.jar"})
+    check("D 多单元VERIFY退回二分", e.phase is Phase.BISECT)
+    check("D 冻结集清空", e.frozen == frozenset())
+    # z 已被 B 轮剔出嫌疑池: 冻结不记账, 解冻不回池(资格对称还原)
+    f3 = e.freeze(frozenset({"z.jar"}))
+    u3 = e.unfreeze(frozenset({"z.jar"}))
+    check("D 非池解冻不回池", f3 == frozenset({"z.jar"})
+          and u3 == frozenset({"z.jar"})
+          and set(e.suspects) == {"w.jar", "x.jar", "y.jar"}
+          and e.phase is Phase.BISECT)
+
+    # --- E: 会话重放 roundtrip(v3 显式事件确定性重建) ---
+    e2 = BisectEngine(graph)
+    e2.report(Answer.PRESENT, frozenset())
+    e2.freeze(frozenset({"x.jar"}))        # BISECT 中手动冻结
+    p1 = e2.current_plan
+    e2.report(Answer.PRESENT, frozenset(graph.closure(
+        set(p1.proposed_disabled), set(graph.universe))))
+    e2.freeze(frozenset({"w.jar"}))        # 冻掉唯一嫌疑 → 排空 DONE
+    e2.unfreeze(frozenset({"w.jar"}))      # 撤销结案 → VERIFY
+    session_mod.SESSIONS_DIR = os.path.join(tmp, "sessions-mf")
+    res = scan_mods_dir(os.path.join(tmp, "mods2"), cfg)
+    path = session_mod.save_session(res, e2)
+    check("E 保存成功", path is not None and os.path.isfile(path))
+    rr = session_mod.restore_session(path, cfg)
+    check("E 恢复ok", rr.ok, rr.reason)
+    if rr.ok:
+        check("E 相位一致", rr.engine.phase is e2.phase)
+        check("E 冻结集一致", rr.engine.frozen == e2.frozen)
+        check("E 嫌疑集一致", set(rr.engine.suspects) == set(e2.suspects))
+        check("E 历史长度一致", len(rr.engine.history) == len(e2.history))
+        check("E 轮次一致", rr.engine.round_index == e2.round_index)
+        # 白盒: 记账状态(_frozen_was_suspect)随重放确定式重建
+        check("E 冻结记账一致",
+              rr.engine._frozen_was_suspect == e2._frozen_was_suspect)
+
+    # --- F: OBSTRUCT 相位拒绝手动冻结/解冻(frozen∩pool=∅ 不变量保护) ---
+    e3 = BisectEngine(graph)
+    e3.report(Answer.PRESENT, frozenset())
+    p1 = e3.current_plan
+    e3.report(Answer.UNTESTED,
+              frozenset(graph.universe - set(p1.target_enabled)))
+    check("F 进阻碍子流程", e3.phase is Phase.OBSTRUCT)
+    check("F OBSTRUCT拒绝冻结", e3.freeze(frozenset({"z.jar"})) == frozenset())
+    check("F OBSTRUCT拒绝解冻", e3.unfreeze(frozenset({"z.jar"})) == frozenset())
+
+
 # ---------------------------------------------------------------- main
 
 def main() -> int:
@@ -827,6 +924,7 @@ def main() -> int:
         test_engine_scan(graph)
         test_engine_obstruct(graph)
         test_engine_obstruct_degenerate(cfg)
+        test_engine_manual_freeze(graph, tmp, cfg)
         test_executor(res2, cfg)
         test_session(tmp, cfg)
         test_sortkey()
