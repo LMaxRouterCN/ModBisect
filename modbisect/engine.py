@@ -19,6 +19,9 @@
 - 验证轮: |S| = 1 后,目标启用集 = 嫌疑单元的支撑闭包(正向依赖链全开),
   隔离复现 → 确诊单因;不复现 → 交互问题/信号噪声,结案
 - 退化保护: S 归算后未缩小(闭包吞掉分割) → 转人工;S 空(信号矛盾) → 报错
+- 阻碍轮(v0.5): 玩家无法测试(游戏起不来/无法观察) -> 回退本轮,
+  子二分定位"阻碍 mod"(禁用即破坏可测性者) -> 冻结(恒启用+移出
+  调度与嫌疑池) -> 回主流程重切; 罪魁被冻出的风险已由用户确认自担
 
 调度契约(UI 层是唯一调度者):
 1. plan = engine.current_plan            (只读,幂等)
@@ -41,12 +44,16 @@ class Answer(str, Enum):
     PRESENT = "present"  # 还在(问题在当前启用侧)
     ABSENT = "absent"    # 消失了(问题在刚被禁用侧)
     SKIP = "skip"        # 跳过(仅基准轮合法: 信任用户前提直接进二分)
+    UNTESTED = "untested"        # 此次未测试(-> 阻碍子流程 v0.5)
+    TESTABLE = "testable"        # 可测性轮: 可以正常测试
+    UNTESTABLE = "untestable"    # 可测性轮: 无法测试(阻碍在此侧)
 
 
 class Phase(str, Enum):
     """会话阶段。"""
     BASELINE = "baseline"  # 基准轮(前提确认)
     SCAN = "scan"          # 卷帘进行中(v0.4: 锁序逐段卷, 锁定段转二分)
+    OBSTRUCT = "obstruct"  # 可测性子二分(v0.5: 定位阻碍 mod, 冻结后回主流程)
     BISECT = "bisect"      # 二分进行中
     VERIFY = "verify"      # 验证轮(最小复现集隔离验证)
     DONE = "done"          # 终局(读 verdict)
@@ -100,6 +107,20 @@ class ScanSpec:
     from_top: bool          # True=由顶向下(展示语义)
 
 
+@dataclass
+class _ObstructState:
+    """可测性子二分进行态(v0.5; 会话重放确定式重建, 不单独落盘).
+
+    pool = 仍含阻碍的绑定单元集(单调收缩, 至少含一个阻碍单元);
+    base_actual = 触发时的最近可测配置(实际禁用集, 闭包封闭);
+    return_phase = 冻结完成后回归的主流程相位.
+    """
+
+    pool: frozenset[int]
+    base_actual: frozenset[str]
+    return_phase: Phase
+
+
 class BisectEngine:
     """二分状态机。
 
@@ -119,6 +140,8 @@ class BisectEngine:
         self._round_index: int = 0
         self.history: list[RoundRecord] = []
         self.verdict: Verdict | None = None
+        self._frozen: frozenset[str] = frozenset()  # 阻碍集(v0.5): 恒钉启用
+        self._obstruct: _ObstructState | None = None  # 可测性子二分进行态
 
     # -------------------------------------------------- 展示辅助(只读)
 
@@ -139,6 +162,11 @@ class BisectEngine:
     def round_index(self) -> int:
         return self._round_index
 
+    @property
+    def frozen(self) -> frozenset[str]:
+        """被冻结的阻碍 mod 集(base 名, 恒钉启用, 已移出嫌疑与调度)。"""
+        return self._frozen
+
     # -------------------------------------------------- 计划推导(只读)
 
     @property
@@ -155,7 +183,7 @@ class BisectEngine:
             )
         if self.phase is Phase.VERIFY:
             unit_jars = self._single_suspect_unit()
-            target = self.graph.support(unit_jars)  # 嫌疑 + 支撑依赖链
+            target = self.graph.support(unit_jars) | self._frozen  # 嫌疑+支撑依赖链+冻结恒钉启用
             return RoundPlan(
                 index=self._round_index + 1,
                 phase=Phase.VERIFY,
@@ -167,22 +195,24 @@ class BisectEngine:
         if self.phase is Phase.SCAN:
             # 卷帘轮(v0.4): 帘带 = 锁序中下一 chunk 个(前缀已卷过)
             spec = self.scan_spec
-            band = spec.order[self._scan_pos:self._scan_pos + spec.chunk]
+            # v0.5: 帘带跳过冻结成员(钉启用不可卷), 指针消耗含跨过冻结位
+            band, _ = self._scan_band()
             band_set = frozenset(band)
             if spec.enable:
                 # 启用方向: 静默底场(仅已卷段+帘带支撑闭包启用),
                 # 判据=问题出现; support 拖入的依赖"提前上场",
                 # 记账按执行层实际启用集归算(与闭包拖拽同构)
                 target = (frozenset(spec.order[:self._scan_pos])
-                          | self.graph.support(band_set))
+                          | self.graph.support(band_set)
+                          | self._frozen)
                 eff = self.universe - target
                 prompt = (f"卷帘轮: 启用下一段 {len(band)} 个"
                           f"(其余 {len(eff)} 个全禁), 测试问题是否出现")
             else:
                 # 禁用方向: 全启用前提(同基准轮), 逐段禁用(含闭包拖拽)
-                rolled = frozenset(spec.order[:self._scan_pos]) | band_set
+                rolled = ((frozenset(spec.order[:self._scan_pos]) - self._frozen) | band_set)
                 eff = self.graph.closure(rolled, set(self.universe))
-                target = self.universe - eff
+                target = (self.universe - eff) | self._frozen
                 prompt = (f"卷帘轮: 禁用下一段 {len(band)} 个, "
                           "测试问题是否消失")
             return RoundPlan(
@@ -193,6 +223,32 @@ class BisectEngine:
                 proposed_disabled=frozenset(eff),
                 suspects=self.suspects,
             )
+        if self.phase is Phase.OBSTRUCT:
+            # 可测性轮(v0.5): 最近可测态 + 试探禁用候选池后半(闭包扩张)
+            ob = self._obstruct
+            assert ob is not None
+            ordered = sorted(ob.pool)
+            half = ordered[len(ordered) // 2:]
+            half_jars: set[str] = set()
+            cand: set[str] = set()
+            for i in ordered:
+                cand |= self.graph.units[i]
+                if i in half:
+                    half_jars |= self.graph.units[i]
+            # 子轮目标 = 上一可测配置 + 试探半侧(闭包扩张); 冻结恒钉启用
+            eff = self.graph.closure(ob.base_actual | half_jars,
+                                     set(self.universe))
+            target = (self.universe - eff) | self._frozen
+            return RoundPlan(
+                index=self._round_index + 1,
+                phase=Phase.OBSTRUCT,
+                prompt=(f"可测性轮: 额外禁用 {len(half_jars)} 个阻碍候选"
+                        f"(池剩 {len(ob.pool)} 组), 游戏能否正常启动并观察?"),
+                target_enabled=target,
+                proposed_disabled=frozenset(half_jars),
+                suspects=frozenset(cand),
+            )
+
         # Phase.BISECT: 嫌疑单元索引排序后均分,提议禁用后半。
         # 按单元数(而非 jar 加权)均分: 轮次复杂度 = log2(单元数),
         # 单元粒度均衡即轮次最优;闭包吞并的浪费由实际生效集归算兜底
@@ -208,7 +264,8 @@ class BisectEngine:
             index=self._round_index + 1,
             phase=Phase.BISECT,
             prompt=f"二分轮: 禁用约一半嫌疑 mod({n_dis} 个),启动游戏测试",
-            target_enabled=self.universe - eff,
+            # v0.5: 冻结恒钉启用(闭包拖拽也拖不死)
+            target_enabled=(self.universe - eff) | self._frozen,
             proposed_disabled=frozenset(disabled),
             suspects=self.suspects,
         )
@@ -223,6 +280,8 @@ class BisectEngine:
         actual_disabled 契约: W 域内本轮实际处于禁用态的 jar 集
         (执行层 diff 完成后回读磁盘的回报,含闭包拖拽扩大)。
         crashed = 本轮检测到游戏崩溃(信号无效,本轮作废重测)。
+        UNTESTED(此次未测试) = 本轮无法观察 -> 回退并进可测性子二分
+        (v0.5 阻碍子流程, 归算见 _report_untested/_report_obstruct)。
         """
         plan = self.current_plan  # 归档快照(推进前取,幂等)
 
@@ -241,6 +300,16 @@ class BisectEngine:
             plan=plan, answer=answer.value,
             actual_disabled=frozenset(actual_disabled)))
 
+        # v0.5 阻碍子流程分发(归档后: 阻碍轮入 history, 重放据此重建冻结与子流程态)
+        if self.phase is Phase.OBSTRUCT:
+            if answer not in (Answer.TESTABLE, Answer.UNTESTABLE):
+                return Action.RETEST_SAME  # 防御: 子流程只收可测性答案
+            return self._report_obstruct(answer, actual_disabled)
+        if answer in (Answer.TESTABLE, Answer.UNTESTABLE):
+            return Action.RETEST_SAME  # 防御: 可测性答案只在子流程合法
+        if answer is Answer.UNTESTED:
+            # 此次未测试 -> 回退本轮, 子二分定位阻碍后回主流程
+            return self._report_untested(actual_disabled)
         if self.phase is Phase.BASELINE:
             return self._report_baseline(answer)
         if self.phase is Phase.SCAN:
@@ -282,10 +351,21 @@ class BisectEngine:
         if not after:
             # 归算为空: 各轮信号自相矛盾(理论不可达,防御兜底)
             self._suspect_units = after
-            self.verdict = Verdict(
-                title="信号矛盾",
-                detail="嫌疑集被归算为空: 各轮回答互相矛盾,或依赖图与实际"
-                       "加载行为不符。建议核实观察可靠性后重新排查。")
+            if self._frozen:
+                # 嫌疑排空且存在冻结: 罪魁大概率在被冻结的阻碍集中
+                self.verdict = Verdict(
+                    title="嫌疑排空(存在冻结)",
+                    detail="嫌疑集归算为空, 且此前有 mod 因破坏可测性被"
+                           "冻结: 罪魁可能就在冻结集 "
+                           + ", ".join(sorted(self._frozen))
+                           + " 中(恒启用钉死, 未参与二分)。\n"
+                           "建议: 人工核查上述 mod, 或核实观察可靠性后"
+                           "重新排查。")
+            else:
+                self.verdict = Verdict(
+                    title="信号矛盾",
+                    detail="嫌疑集被归算为空: 各轮回答互相矛盾,或依赖图与"
+                           "实际加载行为不符。建议核实观察可靠性后重新排查。")
             self.phase = Phase.DONE
             return Action.DONE
         if len(after) == len(before):
@@ -328,8 +408,9 @@ class BisectEngine:
             locked = answer is not Answer.PRESENT
             after = (before & hit_dis if locked else before - hit_dis)
         self._round_index += 1
-        self._scan_pos = min(self._scan_pos + spec.chunk,
-                             len(spec.order))
+        # v0.5: 指针推进到本帘带消耗终点(含跨过冻结位, 与计划同源)
+        _, next_pos = self._scan_band()
+        self._scan_pos = next_pos
 
         if not after:
             # 卷尽未命中: 罪魁不在 W(前提/观察失真), 与信号矛盾同型
@@ -337,7 +418,7 @@ class BisectEngine:
             self.verdict = Verdict(
                 title="卷帘未命中",
                 detail="锁序全部卷完仍未能定位罪魁: 回答链与前提矛盾,"
-                       "或罪魁在初始禁用集/依赖图外。\n"
+                       "或罪魁在初始禁用集/依赖图外/被冻结的阻碍集中。\n"
                        "建议: 核实问题复现条件后重新排查。")
             self.phase = Phase.DONE
             return Action.DONE
@@ -345,6 +426,96 @@ class BisectEngine:
         if locked:
             self.phase = Phase.BISECT  # 锁段: 后续沿用二分收敛
             return self._enter_next_phase_or_verify()
+        return Action.NEXT_PLAN
+
+    def _report_untested(self, actual_disabled: frozenset[str]) -> Action:
+        """此次未测试 -> 回退本轮 + 可测性子二分入口(v0.5).
+
+        数学: 单调阻碍假设(禁任一阻碍 mod 即破坏可测性)下,
+        本轮实际禁用集 ⊆ 某可测配置 ⟹ 本轮应可测; 故结构性不可测
+        必有新增禁用增量(候选池非空):
+        - 池空 -> 偶发/外部因素 -> 同计划重测(不冻结不回退);
+        - 池非空 -> 阻碍 ∈ 池 -> 进 OBSTRUCT 子二分(基准=最近可测配置)
+        """
+        # A0 = 最近一次真实作答(present/absent)轮的实际禁用集; 无则全启
+        base_actual: frozenset[str] = frozenset()
+        for rec in reversed(self.history[:-1]):  # 不含刚记录的本轮
+            if rec.answer in (Answer.PRESENT.value, Answer.ABSENT.value):
+                base_actual = rec.actual_disabled
+                break
+        pool_jars = ((frozenset(actual_disabled) - base_actual)
+                     - self._frozen)
+        if not pool_jars and self.phase is Phase.BASELINE:
+            # 全启用(无可开关增量)即不可测: 排查前提不成立
+            self.verdict = Verdict(
+                title="基准轮无法测试",
+                detail="全部 mod 启用状态下即无法启动游戏或观察问题 — "
+                       "排查前提不成立(可能是安装损坏或非 mod 因素)。\n"
+                       "建议: 先修复游戏启动问题, 再重新开始排查。")
+            self.phase = Phase.DONE
+            return Action.DONE
+        if not pool_jars:
+            # 单调结构下本轮 ⊆ 最近可测配置: 不可测属偶发/外部 -> 重测
+            return Action.RETEST_SAME
+        pool = frozenset(self.graph.unit_of[j] for j in pool_jars
+                         if j in self.graph.unit_of)
+        self._obstruct = _ObstructState(
+            pool=pool, base_actual=base_actual, return_phase=self.phase)
+        self._round_index += 1
+        self.phase = Phase.OBSTRUCT
+        return Action.NEXT_PLAN
+
+    def _report_obstruct(self, answer: Answer,
+                         actual_disabled: frozenset[str]) -> Action:
+        """可测性子二分归算(v0.5): 收缩候选池, 剩一冻结回主流程.
+
+        hit = 本子轮实际被禁单元(含闭包扩张, 不含钉启的冻结集):
+        TESTABLE -> 池剔除 hit(阻碍不在被禁侧);
+        UNTESTABLE -> 池收缩至 hit 交集(阻碍在被禁侧);
+        |池| = 1 -> 该单元即阻碍: 冻结(恒钉启用 + 双剔除)后回原相位.
+        """
+        ob = self._obstruct
+        assert ob is not None
+        hit = frozenset(self.graph.unit_of[j] for j in actual_disabled
+                        if j in self.graph.unit_of)
+        if answer is Answer.TESTABLE:
+            after = ob.pool - hit
+        else:
+            after = ob.pool & hit
+        self._round_index += 1
+
+        if not after:
+            # 全部候选曾被禁却可测: 与阻碍前提矛盾(观察不稳定/外部)
+            self._obstruct = None
+            self.verdict = Verdict(
+                title="可测性信号矛盾",
+                detail="阻碍候选全部被禁用后反而可测, 与「存在阻碍」"
+                       "前提矛盾 — 观察可能不稳定, 或受非 mod 因素"
+                       "干扰。\n建议: 核实测试条件后重新开始排查。")
+            self.phase = Phase.DONE
+            return Action.DONE
+        if len(after) == 1:
+            # 唯一候选 = 阻碍单元: 冻结(钉启用) + 双剔除, 回主流程
+            idx = next(iter(after))
+            self._frozen = self._frozen | self.graph.units[idx]
+            self._obstruct = None
+            after_s = self._suspect_units - {idx}
+            self._suspect_units = after_s
+            self.phase = ob.return_phase
+            if not after_s:
+                # 嫌疑全部被冻结排除: 罪魁可能就在冻结集(用户自担)
+                self.verdict = Verdict(
+                    title="嫌疑被冻结排空",
+                    detail="全部嫌疑 mod 均作为启动阻碍被冻结排除。"
+                           "罪魁可能就在冻结集: "
+                           + ", ".join(sorted(self._frozen))
+                           + "\n(冻结 = 恒启用钉死, 不参与开关二分)\n"
+                           "建议: 人工核查上述 mod, 或核实复现条件后"
+                           "重新排查。")
+                self.phase = Phase.DONE
+                return Action.DONE
+            return self._enter_next_phase_or_verify()
+        ob.pool = after
         return Action.NEXT_PLAN
 
     def _report_verify(self, answer: Answer) -> Action:
@@ -377,3 +548,25 @@ class BisectEngine:
         """VERIFY 阶段的嫌疑单元成员集(此时 S 恰有一个单元)。"""
         idx = next(iter(self._suspect_units))
         return self.graph.units[idx]
+
+    def _scan_band(self) -> tuple[list[str], int]:
+        """从当前指针取下一帘带(v0.5: 跳过冻结成员), 返回(帘带, 消耗后指针).
+
+        冻结 mod 恒钉启用不可卷, 指针越过即视为已消耗(不再出现在任何
+        帘带); 指针推进到帘带最后成员之后(含跨过的冻结位), 计划推导与
+        report 推进共用本函数保证同源.
+        """
+        spec = self.scan_spec
+        assert spec is not None  # 仅 SCAN 相位调用
+        pos = self._scan_pos
+        band: list[str] = []
+        last = pos
+        while pos < len(spec.order):
+            name = spec.order[pos]
+            pos += 1
+            if name not in self._frozen:
+                band.append(name)
+                last = pos
+                if len(band) >= spec.chunk:
+                    break
+        return band, (last if band else pos)

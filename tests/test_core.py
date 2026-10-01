@@ -608,6 +608,140 @@ def test_engine_scan(graph: DependencyGraph) -> None:
           and e5.suspects == frozenset({"z.jar"}))
 
 
+def test_engine_obstruct(graph: DependencyGraph) -> None:
+    """阻碍子流程(v0.5): 未测试→候选池→子二分→冻结→回主流程。
+
+    场景(与主测试同图): W={w,x,y,z}, 单元 {w},{x,y}(SCC),{z};
+    锁序=字典序。池=本轮实际禁用集−最近可测配置−冻结集(单调阻碍假设)。
+    [长期记忆: 010] 阻碍子流程设计定案。
+    """
+    order = tuple(sorted(graph.universe))  # (w, x, y, z)
+
+    # --- A: 二分中未测试 → 子二分冻结 → 回二分收敛到确诊 ---
+    e = BisectEngine(graph)
+    a = e.report(Answer.PRESENT, frozenset())  # 基准复现
+    check("A 基准复现进二分", a is Action.NEXT_PLAN
+          and e.phase is Phase.BISECT)
+    p1 = e.current_plan
+    actual1 = frozenset(graph.universe - set(p1.target_enabled))
+    a = e.report(Answer.UNTESTED, actual1)     # 二分轮起不来
+    check("A 未测试进子流程", a is Action.NEXT_PLAN
+          and e.phase is Phase.OBSTRUCT)
+    p2 = e.current_plan
+    check("A 子轮试探⊆候选池", p2.phase is Phase.OBSTRUCT
+          and set(p2.proposed_disabled) <= set(actual1))
+    check("A 子轮提示", "可测性轮" in p2.prompt)
+    actual2 = frozenset(graph.closure(set(p2.proposed_disabled),
+                                      set(graph.universe)))
+    a = e.report(Answer.UNTESTABLE, actual2)   # 阻碍在被禁侧
+    check("A 阻碍候选冻结", a is Action.NEXT_PLAN
+          and e.phase is Phase.BISECT
+          and e.frozen == frozenset(p2.proposed_disabled))
+    check("A 冻结双剔除嫌疑", e.suspects == graph.universe - e.frozen
+          and e.suspect_count == 2)
+    p3 = e.current_plan
+    check("A 回二分绕开冻结", not (set(p3.proposed_disabled) & e.frozen))
+    actual3 = frozenset(graph.closure(set(p3.proposed_disabled),
+                                      set(graph.universe)))
+    a = e.report(Answer.PRESENT, actual3)
+    check("A 二分收敛进验证", a is Action.NEXT_PLAN
+          and e.phase is Phase.VERIFY)
+    p4 = e.current_plan
+    sus = set(e.suspects)
+    check("A 验证目标=支撑∪冻结", set(p4.target_enabled)
+          == set(graph.support(sus)) | set(e.frozen))
+    a = e.report(Answer.PRESENT,
+                 frozenset(graph.universe - set(p4.target_enabled)))
+    check("A 确诊收束", a is Action.DONE and e.verdict is not None
+          and set(e.verdict.culprit) == sus)
+
+    # --- B: 验证轮不可测且池空(⊆最近可测) → 同计划幂等重测 ---
+    e = BisectEngine(graph)
+    e.report(Answer.PRESENT, frozenset())
+    p1 = e.current_plan
+    e.report(Answer.PRESENT,
+             frozenset(graph.universe - set(p1.target_enabled)))
+    check("B 二分一轮进验证", e.phase is Phase.VERIFY)
+    pv = e.current_plan
+    a = e.report(Answer.UNTESTED,
+                 frozenset(graph.universe - set(pv.target_enabled)))
+    check("B 池空幂等重测", a is Action.RETEST_SAME
+          and e.phase is Phase.VERIFY
+          and e.current_plan == pv)
+
+    # --- C: 基准不可测(全启用也起不来) → 前提不成立结案 ---
+    e = BisectEngine(graph)
+    a = e.report(Answer.UNTESTED, frozenset())
+    check("C 基线不可测结案", a is Action.DONE and e.verdict is not None
+          and "基准" in e.verdict.title)
+
+    # --- D: 卷帘入口单候选 → 确认轮冻结回卷帘 / 可测矛盾结案 ---
+    e = BisectEngine(graph, ScanSpec(order=order, chunk=1, enable=False,
+                                     from_top=True))
+    e.report(Answer.SKIP, frozenset())
+    a = e.report(Answer.UNTESTED, frozenset({"w.jar"}))
+    check("D 单候选进确认轮", a is Action.NEXT_PLAN
+          and e.phase is Phase.OBSTRUCT)
+    p = e.current_plan
+    check("D 确认轮池剩1", p.phase is Phase.OBSTRUCT
+          and "池剩 1 组" in p.prompt)
+    a = e.report(Answer.UNTESTABLE, frozenset({"w.jar"}))
+    check("D 确认冻结回卷帘", a is Action.NEXT_PLAN
+          and e.phase is Phase.SCAN
+          and e.frozen == frozenset({"w.jar"}))
+    p = e.current_plan
+    # 冻结跳卷: 帘带越过 w, 下带={x}闭包拖 y; w 钉启用
+    check("D 冻结跳卷帘带", p.proposed_disabled
+          == frozenset({"x.jar", "y.jar"}))
+    check("D 冻结钉启用", set(p.target_enabled)
+          == set(graph.universe) - {"x.jar", "y.jar"})
+
+    e2 = BisectEngine(graph, ScanSpec(order=order, chunk=1, enable=False,
+                                      from_top=True))
+    e2.report(Answer.SKIP, frozenset())
+    e2.report(Answer.UNTESTED, frozenset({"w.jar"}))
+    a = e2.report(Answer.TESTABLE, frozenset({"w.jar"}))
+    check("D 确认可测矛盾结案", a is Action.DONE
+          and e2.verdict is not None
+          and "可测性" in e2.verdict.title)
+
+    # --- E: 嫌疑全部被冻结排空 → 专属结案(罪魁可能=冻结集) ---
+    e = BisectEngine(graph, ScanSpec(order=order, chunk=1, enable=False,
+                                     from_top=True))
+    e.report(Answer.SKIP, frozenset())
+    e.report(Answer.UNTESTED, frozenset({"w.jar"}))
+    a = e.report(Answer.UNTESTABLE, frozenset({"w.jar"}))   # 冻结 w
+    check("E 冻结w回卷帘", a is Action.NEXT_PLAN
+          and e.phase is Phase.SCAN
+          and e.frozen == frozenset({"w.jar"}))
+    a = e.report(Answer.PRESENT, frozenset({"x.jar", "y.jar"}))  # x 带
+    check("E 还在剔除SCC", a is Action.NEXT_PLAN
+          and e.suspects == frozenset({"z.jar"}))
+    e.report(Answer.PRESENT, frozenset({"x.jar", "y.jar"}))  # y 带(前缀重算)
+    e.report(Answer.UNTESTED,
+             frozenset({"x.jar", "y.jar", "z.jar"}))  # z 带
+    a = e.report(Answer.UNTESTABLE,
+                 frozenset({"x.jar", "y.jar", "z.jar"}))  # 冻结 z
+    check("E 嫌疑被冻结排空结案", a is Action.DONE
+          and e.verdict is not None
+          and "冻结" in e.verdict.title
+          and e.frozen == frozenset({"w.jar", "z.jar"}))
+
+    # --- F: 相位-答案合法性防御(非法组合不推进) ---
+    e = BisectEngine(graph)
+    e.report(Answer.PRESENT, frozenset())
+    a = e.report(Answer.TESTABLE, frozenset({"x.jar"}))
+    check("F 主流程拒可测性答案", a is Action.RETEST_SAME
+          and e.phase is Phase.BISECT)
+    e2 = BisectEngine(graph)
+    e2.report(Answer.PRESENT, frozenset())
+    e2.report(Answer.UNTESTED,
+              frozenset({"x.jar", "y.jar", "z.jar"}))
+    a = e2.report(Answer.PRESENT, frozenset())
+    check("F 子流程拒主答案", a is Action.RETEST_SAME
+          and e2.phase is Phase.OBSTRUCT)
+
+
 # ---------------------------------------------------------------- main
 
 def main() -> int:
@@ -621,6 +755,7 @@ def main() -> int:
         test_engine(graph, W)
         test_engine_branches(graph, W)
         test_engine_scan(graph)
+        test_engine_obstruct(graph)
         test_executor(res2, cfg)
         test_session(tmp, cfg)
         test_sortkey()

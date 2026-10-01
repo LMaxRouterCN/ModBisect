@@ -381,6 +381,50 @@ def main() -> int:
         app.processEvents()
         check("模式复位", win._cfg.ui_scan_mode == "bisect")
 
+        # ---- 12.6 阻碍子流程(v0.5): 未测试→可测性子二分→冻结→回主 ----
+        # 12.5 尾态: SCAN 锁段后 BISECT(S={m0..m3}), 本轮计划禁 {m2,m3}
+        # [长期记忆: 010] 断言全部派生自 plan/engine 属性(不锚单元索引序)
+        win._on_debug_fake_game()
+        check("未测试按钮主相位可见", win._btn_judge_untested.isVisible())
+        check("可测性组非子流程隐藏",
+              not win._btn_judge_testable.isVisible())
+        win._on_judge_present()  # 还在 → S={m0,m1}(下一轮禁半侧)
+        _wait_state(win, "wait_launch", 10.0)
+        p_half = win._current_plan  # 禁单嫌疑的二分轮计划
+        win._on_debug_fake_game()
+        win._on_judge_untested()  # 本轮起不来 → 候选池=本轮增量
+        _wait_state(win, "wait_launch", 10.0)
+        check("进可测性子流程", win._current_plan.phase is Phase.OBSTRUCT)
+        check("可测性轮提示", "可测性轮" in win._current_plan.prompt)
+        win._on_debug_fake_game()
+        check("可测性按钮组接管", win._btn_judge_testable.isVisible()
+              and win._btn_judge_untestable.isVisible())
+        check("主判决组退场", not win._btn_judge_present.isVisible()
+              and not win._btn_judge_untested.isVisible())
+        win._on_judge_untestable()  # 确认阻碍=被禁候选 → 冻结
+        _wait_state(win, "wait_launch", 10.0)
+        check("冻结=本轮被禁候选", win._engine.frozen
+              == frozenset(p_half.proposed_disabled))
+        check("冻结后单嫌疑进验证", win._current_plan.phase is Phase.VERIFY)
+        check("验证目标=嫌疑支撑∪冻结",
+              set(win._current_plan.target_enabled)
+              == set(win._engine.graph.support(set(win._engine.suspects)))
+              | set(win._engine.frozen))
+        check("冻结计数标签", "冻结 1" in win._lbl_frozen.text())
+        _fj = next(iter(win._engine.frozen))
+        check("冻结行橙◆", win._table.item(
+            _row_of(win, _fj), 5).text() == "◆")
+        check("冻结日志入册", "[冻结]" in win._log_view.toPlainText())
+        sp = session_mod.save_session(win._scan, win._engine)
+        rr = session_mod.restore_session(sp, cfg)
+        check("阻碍会话恢复", rr.ok, rr.reason)
+        if rr.ok:
+            check("冻结态重放一致", rr.engine.frozen
+                  == win._engine.frozen
+                  and rr.engine.phase is win._engine.phase
+                  and rr.engine.suspects == win._engine.suspects
+                  and rr.engine.round_index == win._engine.round_index)
+
         # ---- 13. 弹窗单元(直构直验, 不 exec) ----
         sd = SnapshotDialog([{"path": "a.json", "created": "t1",
                               "mods_dir": "d", "count": 3}])

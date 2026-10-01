@@ -186,6 +186,9 @@ class MainWindow(QMainWindow):
         row2.addWidget(self._lbl_round)
         self._lbl_suspects = QLabel("—")
         row2.addWidget(self._lbl_suspects)
+        self._lbl_frozen = QLabel("")  # v0.5: 冻结阻碍计数(无冻结时空)
+        self._lbl_frozen.setStyleSheet(f"color: {ORANGE};")  # 呼应表格◆橙
+        row2.addWidget(self._lbl_frozen)
         root.addLayout(row2)
 
         # 状态行
@@ -294,8 +297,25 @@ class MainWindow(QMainWindow):
         self._btn_judge_retest.setMinimumHeight(52)
         self._btn_judge_retest.clicked.connect(self._on_judge_retest)
         side.addWidget(self._btn_judge_retest)
+        # v0.5 阻碍子流程判决: 未测试(主相位) + 可测性对(仅 OBSTRUCT)
+        self._btn_judge_untested = QPushButton("此次未测试\n(游戏起不来/没测成)")
+        self._btn_judge_untested.setMinimumHeight(52)
+        self._btn_judge_untested.setToolTip(
+            "本轮没能启动或观察 → 回退本轮, 子二分定位「阻碍 mod」并冻结(恒启用)")
+        self._btn_judge_untested.clicked.connect(self._on_judge_untested)
+        side.addWidget(self._btn_judge_untested)
+        self._btn_judge_testable = QPushButton("能正常启动并测试\n(阻碍不在这侧)")
+        self._btn_judge_testable.setMinimumHeight(52)
+        self._btn_judge_testable.clicked.connect(self._on_judge_testable)
+        side.addWidget(self._btn_judge_testable)
+        self._btn_judge_untestable = QPushButton("无法启动或测试\n(阻碍在这侧)")
+        self._btn_judge_untestable.setMinimumHeight(52)
+        self._btn_judge_untestable.clicked.connect(self._on_judge_untestable)
+        side.addWidget(self._btn_judge_untestable)
         for b in (self._btn_judge_present, self._btn_judge_absent,
-                  self._btn_judge_skip, self._btn_judge_retest):
+                  self._btn_judge_skip, self._btn_judge_retest,
+                  self._btn_judge_untested, self._btn_judge_testable,
+                  self._btn_judge_untestable):
             b.setVisible(False)  # 仅 JUDGING 态显示
 
         side_w = QWidget()
@@ -327,11 +347,22 @@ class MainWindow(QMainWindow):
         # 判决组: 仅 JUDGING 可见; 跳过按钮再限基准轮(引擎侧另有二次防御)
         judging = s is UiState.JUDGING
         for b in (self._btn_judge_present, self._btn_judge_absent,
-                  self._btn_judge_skip, self._btn_judge_retest):
+                  self._btn_judge_skip, self._btn_judge_retest,
+                  self._btn_judge_untested):
             b.setVisible(judging)
+        # v0.5 可测性对: 默认隐藏, 仅 OBSTRUCT 态接管(主组退场)
+        for b in (self._btn_judge_testable, self._btn_judge_untestable):
+            b.setVisible(False)
         if judging and self._current_plan is not None:
             self._btn_judge_skip.setVisible(
                 self._current_plan.phase is Phase.BASELINE)
+            if self._current_plan.phase is Phase.OBSTRUCT:
+                # v0.5: 可测性子二分换按钮组(引擎侧另有合法性防御)
+                for b in (self._btn_judge_present, self._btn_judge_absent,
+                          self._btn_judge_skip, self._btn_judge_untested):
+                    b.setVisible(False)
+                self._btn_judge_testable.setVisible(True)
+                self._btn_judge_untestable.setVisible(True)
         # 开始按钮文案: 恢复的会话(引擎在场) = 继续; 全新扫描 = 开始
         if s is UiState.READY:
             self._btn_start.setText(
@@ -349,14 +380,18 @@ class MainWindow(QMainWindow):
         self._log_view.appendPlainText(msg)  # 引用改名后的控件(勿回退)
 
     def _refresh_indicators(self) -> None:
-        """轮次/嫌疑数标签。"""
+        """轮次/嫌疑数/冻结数标签(v0.5 增冻结)。"""
         if self._engine is None:
             self._lbl_round.setText("—")
             self._lbl_suspects.setText("—")
+            self._lbl_frozen.setText("")
         else:
             self._lbl_round.setText(f"轮次 {self._engine.round_index}")
             self._lbl_suspects.setText(
                 f"剩余嫌疑 {self._engine.suspect_count} 单元")
+            self._lbl_frozen.setText(  # v0.5: 冻结计数(无冻结时留空)
+                f"冻结 {len(self._engine.frozen)} 个"
+                if self._engine.frozen else "")
 
     def _restore_ui_prefs(self) -> None:
         """启动恢复 UI 偏好(需求 6): 窗口几何 / 表头状态 / 最后目录。"""
@@ -528,6 +563,7 @@ class MainWindow(QMainWindow):
             self._table.setRowCount(0)
             return
         suspects = self._engine.suspects if self._engine else frozenset()
+        frozen = self._engine.frozen if self._engine else frozenset()
         before = self._selected_bases()  # 身份锚: 刷新前选中集
         header = self._table.horizontalHeader()
         sort_col = header.sortIndicatorSection()
@@ -545,7 +581,7 @@ class MainWindow(QMainWindow):
             self._table.setSortingEnabled(False)  # 填充期禁排序(逐行插入会跳行)
             self._table.setRowCount(len(jars))  # 就地=同数无操作; 重建=扩缩行
             for row, j in enumerate(jars):
-                self._fill_row(row, j, suspects)
+                self._fill_row(row, j, suspects, frozen)
             self._table.setSortingEnabled(True)
             if can:
                 self._table.sortItems(sort_col, sort_order)  # 键变强制重排
@@ -570,8 +606,8 @@ class MainWindow(QMainWindow):
         if self._tree is not None:
             self._tree.refresh()  # v0.3 左树状态着色同步(启停变化后)
 
-    def _fill_row(self, row: int, j, suspects) -> None:
-        """单行填充(全量/就地共用): v0.3.1 从 _refresh_table 抽取。"""
+    def _fill_row(self, row: int, j, suspects, frozen) -> None:
+        """单行填充(全量/就地共用): v0.3.1 从 _refresh_table 抽取; v0.5 冻结◆(橙)。"""
         nkey = name_key(j.label)  # 名称拼音键(需求 1)
         items = [
             self._mk_item("启用" if j.enabled else "禁用",
@@ -580,15 +616,22 @@ class MainWindow(QMainWindow):
             self._mk_item(j.mtime_str, (j.mtime, nkey)),  # 需求 2: 最后修改
             self._mk_item(j.version, (version_key(j.version), nkey)),
             self._mk_item(j.source, (j.source, nkey)),
-            self._mk_item("●" if j.base_name in suspects else "",
-                          (j.base_name in suspects, nkey)),
+            self._mk_item("◆" if j.base_name in frozen else
+                          "●" if j.base_name in suspects else "",
+                          (j.base_name in frozen,
+                           j.base_name in suspects, nkey)),
         ]
         if not j.enabled:
             for it in items:  # 禁用行整体灰显
                 it.setForeground(QColor(TEXT_DIM))
         else:
             items[0].setForeground(QColor(GREEN))  # 启用状态绿(需求 9)
-        items[5].setForeground(QColor(YELLOW))     # 嫌疑标记黄(需求 9)
+        if j.base_name in frozen:
+            # v0.5 冻结: 橙◆(恒启用钉死的启动阻碍, 非嫌疑)
+            items[5].setForeground(QColor(ORANGE))
+            items[5].setToolTip("启动阻碍: 已冻结(恒启用, 不参与二分)")
+        else:
+            items[5].setForeground(QColor(YELLOW))  # 嫌疑标记黄(需求 9)
         for i, it in enumerate(items):
             self._table.setItem(row, i, it)
 
@@ -892,6 +935,17 @@ class MainWindow(QMainWindow):
         # 跳过仅基准轮合法(引擎侧有二次防御, 其他轮按钮不可见)
         self._submit_answer(Answer.SKIP)
 
+    def _on_judge_untested(self) -> None:
+        # v0.5: 此次未测试 → 引擎回退本轮并进可测性子二分(阻碍子流程)
+        self._submit_answer(Answer.UNTESTED)
+
+    def _on_judge_testable(self) -> None:
+        # v0.5: 可测性轮作答(仅 OBSTRUCT 态按钮可见, 引擎侧有防御)
+        self._submit_answer(Answer.TESTABLE)
+
+    def _on_judge_untestable(self) -> None:
+        self._submit_answer(Answer.UNTESTABLE)
+
     def _on_judge_retest(self) -> None:
         """本轮作废: 引擎不推进, 同计划幂等重走(磁盘已是目标态, 零改名)。"""
         if self._state is not UiState.JUDGING:
@@ -903,8 +957,14 @@ class MainWindow(QMainWindow):
         if self._state is not UiState.JUDGING:
             return
         # 用户在崩溃警告下仍作答 = 用户自主确认本轮信号有效
+        frozen_before = self._engine.frozen  # v0.5: 冻结增量观测(日志)
         action = self._engine.report(
             answer, self._last_report.actual_disabled, crashed=False)
+        if self._engine.frozen != frozen_before:
+            # 阻碍子流程刚冻结 mod: 恒启用钉死, 移出嫌疑与调度
+            self._log("[冻结] " + ", ".join(sorted(
+                self._engine.frozen - frozen_before))
+                + " (恒启用钉死, 不再参与启停二分)")
         save_session(self._scan, self._engine)
         if action is Action.DONE:
             self._finish()
