@@ -228,10 +228,10 @@ class MainWindow(QMainWindow):
         self._combo_mode = QComboBox()
         for _t, _d in (
                 ("经典二分", "bisect"),
-                ("卷帘·顶到底 禁用", "top_disable"),
-                ("卷帘·顶到底 启用", "top_enable"),
-                ("卷帘·底到顶 禁用", "bottom_disable"),
-                ("卷帘·底到顶 启用", "bottom_enable")):
+                ("卷帘·由顶部向下 每批禁用", "top_disable"),
+                ("卷帘·由顶部向下 每批启用", "top_enable"),
+                ("卷帘·由底部向上 每批禁用", "bottom_disable"),
+                ("卷帘·由底部向上 每批启用", "bottom_enable")):
             self._combo_mode.addItem(_t, _d)
         self._combo_mode.setToolTip(
             "模式在点击「开始排查」时生效, 会话中途更改不影响进行中的排查;"
@@ -241,9 +241,12 @@ class MainWindow(QMainWindow):
         # _spin_chunk 尚未创建(初始化次序防御)
         self._combo_mode.setCurrentIndex(max(0, _idx))
         self._spin_chunk = QSpinBox()
-        self._spin_chunk.setRange(1, 50)
+        # 上限不设人为值: 自然上限=卷动总数, 超出即一段卷完,
+        # 引擎按锁序兜底(帘带取切片, 越界自动截断)
+        self._spin_chunk.setRange(1, 999999)
         self._spin_chunk.setValue(self._cfg.ui_scan_chunk)
-        self._spin_chunk.setToolTip("卷帘每轮卷动的 mod 个数")
+        self._spin_chunk.setSuffix(" 个")  # 显示「n 个」, 呼应「每批」
+        self._spin_chunk.setToolTip("卷帘每批卷动的 mod 个数(上限即全部)")
         self._spin_chunk.valueChanged.connect(self._on_chunk_changed)
         self._combo_mode.currentIndexChanged.connect(self._on_mode_changed)
         mode_row.addWidget(self._combo_mode, stretch=1)
@@ -952,7 +955,8 @@ class MainWindow(QMainWindow):
         """模式切换: 持久化 + 步长旋钮仅卷帘模式可编辑。"""
         mode = self._combo_mode.itemData(idx)
         self._cfg.ui_scan_mode = mode if mode else "bisect"
-        self._spin_chunk.setEnabled(self._cfg.ui_scan_mode != "bisect")
+        # 经典二分无「批」概念: 步长旋钮直接隐藏(非置灰)
+        self._spin_chunk.setVisible(self._cfg.ui_scan_mode != "bisect")
 
     def _on_chunk_changed(self, v: int) -> None:
         """步长变更: 持久化(会话中更改不影响已冻结的卷动序)。"""
@@ -968,10 +972,10 @@ class MainWindow(QMainWindow):
             self._engine = self._build_engine()
             _m = self._combo_mode.currentData()
             _tag = "经典二分" if _m == "bisect" else (
-                "卷帘·" + ("顶到底 " if _m.startswith("top")
-                           else "底到顶 ")
-                + ("启用" if _m.endswith("enable") else "禁用")
-                + f", 每轮 {self._spin_chunk.value()} 个")
+                "卷帘·" + ("由顶部向下" if _m.startswith("top")
+                           else "由底部向上")
+                + (" 每批启用" if _m.endswith("enable") else " 每批禁用")
+                + f" {self._spin_chunk.value()} 个")
             self._log(f"[会话] 开始排查({_tag}): "
                       f"嫌疑单元 {self._engine.suspect_count}")
         else:

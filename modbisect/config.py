@@ -53,7 +53,7 @@ class AppConfig:
     ui_last_mods_dir: str = ""
     # 排查模式(v0.4): bisect=经典二分; top/bottom × disable/enable=卷帘四向
     ui_scan_mode: str = "bisect"
-    # 卷帘每轮卷动个数(卷帘模式生效, UI 旋钮范围 1..50)
+    # 卷帘每批卷动个数(卷帘模式生效; 上限即全部, 不设人为上限)
     ui_scan_chunk: int = 3
     # ---- 依赖图 ----
     # 这些 modid 由加载器/JDK/游戏本体提供,不参与 mods 目录内的依赖传播

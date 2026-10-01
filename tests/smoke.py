@@ -339,7 +339,7 @@ def main() -> int:
         win._combo_mode.setCurrentIndex(1)  # 卷帘·顶到底 禁用
         app.processEvents()
         check("卷帘模式持久化", win._cfg.ui_scan_mode == "top_disable")
-        check("步长旋钮解锁", win._spin_chunk.isEnabled())
+        check("步长旋钮可见", not win._spin_chunk.isHidden())
         win._on_start()
         _wait_state(win, "wait_launch", 10.0)
         check("卷帘基准轮", win._current_plan.phase is Phase.BASELINE)
