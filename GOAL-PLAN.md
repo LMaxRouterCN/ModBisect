@@ -265,3 +265,18 @@ pool∩hit=pool 零收缩, 而 plan 期 sorted(pool) 确定性重选同一探针
 **测试**: test_core 手动冻结单元 A-F(粒度/事件/门禁/排空结案/资格
 对称/重放 roundtrip); smoke 三窗口冻结冒烟 + 门控; 全量 184 通过 0
 失败, 冒烟 101+0
+
+## v0.5.3 (2026-10-02): 调试直通常亮 + 手动宣布游戏退出
+
+- 背景: max 口述 — 调试按钮不应因状态置灰; WAIT_GAME 下游戏没退出
+  (或游戏根本没开) 时需能直接进判决
+- 门控: _btn_debug 无条件常亮(原 WAIT_LAUNCH 限定退役)
+- _on_debug_fake_game 状态分流:
+  WAIT_LAUNCH → 假启动直判(原路径); WAIT_GAME → 手动宣布退出:
+  procmon.stop() 吞掉晚到的真实退出事件(发射前 finally 自查
+  _tracking 旗标, 零污染), 复用 _on_game_exited 分流(含
+  _pending_finish, 逻辑零复制); 其他态 → 拒绝并提示
+- 测试: smoke 158 行断言反转(常亮); 新增 12.7 场景(WAIT_GAME 直通,
+  procmon 吞停); 全量 core 184+0, smoke 104+0
+- 遗留(非阻塞, 承 v0.5.2): ①冻结排空 verdict 文案 ②解冻 VERIFY
+  单单元边界 ③拒绝态提示的 UI 反馈(当前仅日志)

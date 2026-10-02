@@ -356,8 +356,8 @@ class MainWindow(QMainWindow):
         # 快照与自由开关: 仅空闲态(防磁盘态与引擎推理脱钩)
         self._btn_snap_new.setEnabled(s in idle_like and self._scan is not None)
         self._btn_snap_restore.setEnabled(s in idle_like and self._scan is not None)
-        # 调试直通: 仅等待启动态(WAIT_GAME 走 procmon 真实路径)
-        self._btn_debug.setEnabled(s is UiState.WAIT_LAUNCH)
+        # v0.5.3 调试直通常亮(用户口述: 调试按钮不因状态置灰)
+        self._btn_debug.setEnabled(True)
         # v0.5.2 手动冻结/解冻: 测试三窗口可用; OBSTRUCT 相位拒绝
         # (可测性子二分维护 frozen∩pool=∅ 不变量, 手动插入会假排除候选)
         manual_ok = (s in (UiState.WAIT_LAUNCH, UiState.WAIT_GAME,
@@ -1002,11 +1002,27 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------- 调试直通(需求 10)
 
     def _on_debug_fake_game(self) -> None:
-        """调试通道: 就当我开关过游戏了 — 跳过启动/退出直接进判决。"""
-        if self._state is not UiState.WAIT_LAUNCH:
+        """调试通道: 就当我开关过游戏了 — 跳过启动/退出直接进判决。
+
+        v0.5.3 语义扩展(用户口述: 按钮常亮, 回调按状态分流):
+        - WAIT_LAUNCH: 假启动(原路径, 未开游戏直接进判决);
+        - WAIT_GAME: 手动宣布游戏已退出 — 游戏进程可能仍在跑,
+          procmon 线程经 stop() 旗标吞掉晚到的真实退出事件
+          (发射前 finally 自查 _tracking, 零污染), 再复用
+          _on_game_exited 分流(含 _pending_finish, 逻辑零复制);
+        - 其他状态: 拒绝并提示(直通只对测试窗口有意义)。
+        """
+        if self._state is UiState.WAIT_LAUNCH:
+            self._log("[调试] 跳过游戏启动, 直接进入判决")
+            self._enter_judging()
             return
-        self._log("[调试] 跳过游戏启动, 直接进入判决")
-        self._enter_judging()
+        if self._state is UiState.WAIT_GAME:
+            self._log("[调试] 手动宣布游戏退出, 直接进入判决")
+            if self._procmon is not None:
+                self._procmon.stop()
+            self._on_game_exited()
+            return
+        self._log("[调试] 直通仅限等待启动/游戏运行态")
 
     # -------------------------------------------------- 手动冻结/解冻(v0.5.2)
 

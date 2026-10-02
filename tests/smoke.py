@@ -155,7 +155,7 @@ def main() -> int:
         check("默认名称列升序", hh.sortIndicatorSection() == 1)
         check("列可拖动(列序持久化前提)", hh.sectionsMovable())
         check("右列判决组隐藏", not win._btn_judge_present.isVisible())
-        check("调试按钮门控(非 wait_launch 禁)", not win._btn_debug.isEnabled())
+        check("调试按钮常亮(v0.5.3, IDLE 态)", win._btn_debug.isEnabled())
         check("冻结/解冻门控(IDLE 禁)", not win._btn_freeze.isEnabled()
               and not win._btn_unfreeze.isEnabled())
         check("左树空态(v0.3)", win._tree._title.text() == "依赖树"
@@ -473,6 +473,15 @@ def main() -> int:
                   and rr.engine.phase is win._engine.phase
                   and rr.engine.suspects == win._engine.suspects
                   and rr.engine.round_index == win._engine.round_index)
+
+        # ---- 12.7 手动直通游戏退出(v0.5.3): WAIT_GAME 宣布退出 ----
+        # 尾态 WAIT_LAUNCH(12.6 尾轮停于等启动): 假启动进游戏态再直通
+        win._on_game_launched()
+        check("直通前奏进 WAIT_GAME", win._state.value == "wait_game"
+              and win._procmon is not None and win._procmon.tracking)
+        win._on_debug_fake_game()
+        check("手动宣布退出进 JUDGING", win._state.value == "judging")
+        check("procmon 被直通吞停", not win._procmon.tracking)
 
         # ---- 13. 弹窗单元(直构直验, 不 exec) ----
         sd = SnapshotDialog([{"path": "a.json", "created": "t1",
