@@ -280,3 +280,64 @@ pool∩hit=pool 零收缩, 而 plan 期 sorted(pool) 确定性重选同一探针
   procmon 吞停); 全量 core 184+0, smoke 104+0
 - 遗留(非阻塞, 承 v0.5.2): ①冻结排空 verdict 文案 ②解冻 VERIFY
   单单元边界 ③拒绝态提示的 UI 反馈(当前仅日志)
+
+## v0.6 变更(手动钉扎: 计划提案出口的强制改写层)(2026-10-03)
+
+**场景**: 冻结是"恒启用+移出调度"的单向退场; 用户需要双向且不退场的
+自由意志表达 —— 某 mod 必须参与每轮测试(钉启)或必须排除(钉禁),
+同时保留嫌疑资格继续参与二分推理。钉扎不碰归算逻辑(执行层照常回报
+实际盘面), 只在计划出口统一改写; __version__ 0.6.0。
+
+**引擎**(pin_toggle/pin_clear 公共体 + overlay):
+- pin_toggle(bases, enable): 单元粒度(unit_of 提升); 门禁 —
+  OBSTRUCT/VERIFY/DONE 拒新钉(VERIFY 隔离验证与自由意志冲突,
+  DONE 结案后不改史), BASELINE/BISECT/SCAN 放行(基准轮前钉禁
+  = 用户自定基准盘面); 同单元反向重钉 = 替换语义(摘旧钉新);
+  显式事件入史(kind=pin_on/pin_off, 手动事件不吃轮次号)
+- pin_clear(bases): 双向撤钉; VERIFY 放行(撤钉不引入新冲突),
+  OBSTRUCT/DONE 拒; kind=pin_clear 入史
+- _pin_overlay(target) = (target ∪ 钉启) − 钉禁闭包: 五相位
+  计划出口统一改写(BASELINE/VERIFY/BISECT/SCAN 双向/OBSTRUCT
+  探针预报与出口同构); 归算侧零改动
+- _pin_dead() = closure(钉禁): 钉禁连闭包拖死依赖它的整条链
+  (与双击级联同向), 语义 = 钉住问题侧
+- 收敛语义(二分不收缩的新出口): 嫌疑 ⊆ 钉禁闭包 → "收敛至钉禁
+  闭包"结案(culprit 指名); ⊆ 钉启集 → "收敛至钉启集"(建议撤
+  部分钉启); _verify_entry_guard: 单嫌疑钉禁侧 → 隔离验证
+  无意义 → 结案(title 含"收敛与钉禁一致", 收敛证据保留)
+- 冻结吞钉(手动/自动冻结同规): 钉启冗余摘除(恒启用语义优先);
+  钉禁连根拔 _pin_yield_to_frozen —— 只摘冻结成员自身的钉会漏掉
+  拖死它的外部根源(overlay 仍禁着冻结成员 → 死循环), 故沿钉禁
+  闭包反查整链拔除
+- 冲突守卫(UNTESTED 归算): 钉禁闭包不在基准可达态(base_actual)
+  或钉启破坏基准 → "不可测与钉扎冲突"结案指路(基准重测/撤钉);
+  基准轮不可测 + 钉禁在场 → 不提前结案, RETEST_SAME 留"钉掉
+  问题"通路(可先钉禁疑似罪魁再重测基准)
+- 会话 v4: pin_on/pin_off/pin_clear 显式事件重放(公共体直调);
+  v1/v2/v3 旧会话照常恢复
+
+**UI**(app.py):
+- 过滤框(220px): 名称+拼音双通道子串实时过滤; _refresh_table
+  尾部重放 + sortIndicatorChanged 重放(隐藏态跟行身份不跟行号)
+- _lbl_pinned 金色计数标签(tooltip 列名钉扎方向明细)
+- 右键钉扎菜单: 钉启/钉禁/撤销, 文案前缀分发同一处理器
+- 会话中双击状态列 = 智能钉: 已钉撤销; 未钉按磁盘态反向钉
+  (启用态 → 钉禁, 禁用态 → 钉启)
+- _after_pin 分流: WAIT_LAUNCH 重开轮(计划重取, overlay 吸收,
+  盘面即时生效); 其余相位纯记账(下轮计划自然吸收)
+- 冻结吞钉增量日志 ×2(_submit_answer 自动侧/_manual_toggle
+  手动侧); 状态格文案: 钉启/钉禁直显
+
+**测试**: core 212+0(新增 test_engine_pins A-G: 粒度幂等/overlay
+双侧/替换撤销/全钉禁 ABSENT 不收缩收敛结案/VERIFY 入口守卫白盒/
+链式场景连根拔+冲突守卫+基准重测/会话重放 roundtrip/VERIFY 门禁);
+smoke 115+0(新增 12.55: 过滤双通道+排序重放+钉扎往返净零扰动)
+
+**教训(补丁工程)**: ①verdict 字符串 \n 未双转义 → SyntaxError,
+py_compile 门禁先于回归暴露; ②二分归算方向两度记反(ABSENT →
+after = before ∩ hit: 消失 = 罪魁在实际被禁集内) — 构造断言前
+必须读归算体原文, 不可凭记忆方向; ③smoke 显示名陷阱: jar 无
+displayName 时名称列 = modId("mod7")而非文件名("m7.jar"), UI
+断言须用显示名文本; ④VERIFY 入口守卫的集成触发依赖二分半侧选择
+顺序(实现细节) → 白盒直测(先例 _frozen_was_suspect), 断言契约
+零顺序敏感。

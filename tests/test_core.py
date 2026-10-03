@@ -185,6 +185,28 @@ def test_scanner(tmp: str) -> None:
 
 # ---------------------------------------------------------------- 场景二搭建
 
+# 场景二.5(v0.6 钉扎): 链式依赖 r→d(非 SCC, 跨单元闭包) + 独立 q。
+# closure({d}) = {d, r}(禁 d 拖死依赖者 r) — 连根拔/冲突守卫/重测测试专用。
+TOML_PIN_R = """modLoader="javafml"
+[[mods]]
+modId="modr"
+version="1.0"
+[[dependencies.modr]]
+    modId="modd"
+    type="required"
+"""
+TOML_PIN_D = """modLoader="javafml"
+[[mods]]
+modId="modd"
+version="1.0"
+"""
+TOML_PIN_Q = """modLoader="javafml"
+[[mods]]
+modId="modq"
+version="1.0"
+"""
+
+
 def build_graph_scene(tmp: str, cfg: AppConfig):
     """搭 x↔y/z/w/p 场景, 返回 (scan结果, W上的依赖图)。"""
     mods = os.path.join(tmp, "mods2")
@@ -909,6 +931,150 @@ def test_engine_manual_freeze(graph: DependencyGraph,
     check("F OBSTRUCT拒绝解冻", e3.unfreeze(frozenset({"z.jar"})) == frozenset())
 
 
+def test_engine_pins(graph: DependencyGraph,
+                     tmp: str, cfg: AppConfig) -> None:
+    """v0.6 手动钉扎: 粒度/门禁/overlay/替换/守卫结案/吞钉/冲突/重放。
+
+    主场景沿用 build_graph_scene(W={w,x,y,z}, 单元 {w},{x,y},{z});
+    链式场景(mods-pin)自建: r 依赖 d, closure({d})={d,r} 跨单元拖拽。
+    构造原则: 钉禁恒在禁用侧/钉启恒在启用侧(overlay 数学保证),
+    断言零顺序敏感; VERIFY 入口守卫白盒直测(集成触发依赖二分
+    半侧选择顺序 = 实现细节, 不入断言契约)。
+    """
+    print("[engine: 手动钉扎 v0.6]")
+
+    # --- A: 单元粒度 + 非W拒 + 显式事件 + 幂等(钉禁留嫌疑池) ---
+    e = BisectEngine(graph)
+    e.report(Answer.PRESENT, frozenset())  # 基准 → BISECT(全池)
+    t = e.pin_toggle(frozenset({"y.jar", "ghost.jar"}), False)
+    check("A 单元粒度整钉+非W拒", t == frozenset({"x.jar", "y.jar"}))
+    check("A 钉禁留嫌疑池", set(e.suspects) == set(graph.universe))
+    check("A pinned 属性", e.pinned == frozenset({"x.jar", "y.jar"})
+          and e.pinned_off == frozenset({"x.jar", "y.jar"}))
+    rec = e.history[-1]
+    check("A 显式事件入史", rec.kind == "pin_off" and rec.plan is None
+          and set(rec.jars) == {"x.jar", "y.jar"})
+    check("A 幂等重钉空操作",
+          e.pin_toggle(frozenset({"x.jar"}), False) == frozenset()
+          and len([r for r in e.history if r.kind == "pin_off"]) == 1)
+
+    # --- B: overlay 计划改写(钉禁闭包出启用侧 / 钉启并入启用) ---
+    p = e.current_plan
+    check("B 钉禁闭包出启用侧",
+          not (set(p.target_enabled) & set(e.pinned_off)))
+    e2 = BisectEngine(graph)
+    e2.report(Answer.PRESENT, frozenset())
+    t2 = e2.pin_toggle(frozenset({"z.jar"}), True)
+    p2 = e2.current_plan
+    check("B2 钉启并入启用侧", t2 == frozenset({"z.jar"})
+          and "z.jar" in set(p2.target_enabled))
+    check("B2 钉启留嫌疑池", set(e2.suspects) == set(graph.universe))
+
+    # --- C: 同单元方向翻转 = 替换; 撤钉双向清 + 事件入史 ---
+    t3 = e2.pin_toggle(frozenset({"z.jar"}), False)
+    check("C 翻转替换旧方向", t3 == frozenset({"z.jar"})
+          and e2.pinned_on == frozenset()
+          and e2.pinned_off == frozenset({"z.jar"}))
+    u = e2.pin_clear(frozenset({"z.jar", "ghost.jar"}))
+    check("C 撤钉双向清+非W拒", u == frozenset({"z.jar"})
+          and e2.pinned == frozenset())
+    check("C 撤钉事件入史", e2.history[-1].kind == "pin_clear"
+          and set(e2.history[-1].jars) == {"z.jar"})
+
+    # --- D: 全池钉禁 + ABSENT 不收缩 = 收敛至钉禁闭包; 白盒入口守卫 ---
+    e_d = BisectEngine(graph)
+    e_d.report(Answer.PRESENT, frozenset())
+    e_d.pin_toggle(frozenset(graph.universe), False)  # 全池钉禁
+    # 全钉禁盘面: 实际禁用 = closure(半侧 ∪ 钉禁闭包) = 全部(拖拽)
+    # → ABSENT 归算 after = before ∩ hit = before(不收缩) → 收敛结案
+    act_d = e_d.report(Answer.ABSENT, frozenset(graph.universe))
+    check("D 全钉禁ABSENT不收缩收敛结案", act_d is Action.DONE
+          and e_d.phase is Phase.DONE
+          and "收敛至钉禁闭包" in e_d.verdict.title)
+    check("D 罪魁指名钉禁集",
+          set(e_d.verdict.culprit) == set(graph.universe))
+    # 白盒: VERIFY 入口守卫(单嫌疑钉禁侧 → 隔离验证无意义 → 结案)
+    e_w = BisectEngine(graph)
+    e_w.report(Answer.PRESENT, frozenset())
+    e_w.pin_toggle(frozenset({"z.jar"}), False)
+    e_w._suspect_units = {e_w.graph.unit_of["z.jar"]}
+    check("D2 守卫钉禁侧结案", e_w._verify_entry_guard() is True
+          and e_w.phase is Phase.DONE
+          and "收敛与钉禁一致" in e_w.verdict.title)
+
+    # --- E: 链式场景(跨单元拖拽): 连根拔 / 冲突守卫 / 基准重测通路 ---
+    mods_pin = os.path.join(tmp, "mods-pin")
+    os.makedirs(mods_pin)
+    for name, toml in [("d.jar", TOML_PIN_D), ("r.jar", TOML_PIN_R),
+                       ("q.jar", TOML_PIN_Q)]:
+        make_jar(os.path.join(mods_pin, name), toml_text=toml)
+    res_pin = scan_mods_dir(mods_pin, cfg)
+    g2 = DependencyGraph([j for j in res_pin.jars if j.enabled],
+                         cfg.ignore_modids)
+    check("E 链式闭包拖拽", set(g2.closure({"d.jar"})) == {"d.jar", "r.jar"})
+    # E1: 冻结 r 连根拔 d 的钉禁(否则闭包恒禁 r, 冻结永不生效)
+    e5 = BisectEngine(g2)
+    e5.report(Answer.PRESENT, frozenset())
+    check("E1 钉禁d入位", e5.pin_toggle(frozenset({"d.jar"}), False)
+          == frozenset({"d.jar"}))
+    f5 = e5.freeze(frozenset({"r.jar"}))
+    check("E1 冻结r连根拔钉禁根源", f5 == frozenset({"r.jar"})
+          and e5.frozen == frozenset({"r.jar"})
+          and e5.pinned_off == frozenset())
+    check("E1 冻结成员入计划启用侧",
+          "r.jar" in set(e5.current_plan.target_enabled))
+    # E2: 不可测与钉扎冲突守卫(钉禁闭包改写基准可达态 → 结案指路)
+    e6 = BisectEngine(g2)
+    e6.report(Answer.PRESENT, frozenset())   # base_actual = 全启用
+    e6.pin_toggle(frozenset({"d.jar"}), False)
+    p6 = e6.current_plan
+    act6 = e6.report(Answer.UNTESTED, frozenset(g2.closure(
+        set(p6.proposed_disabled), set(g2.universe))))
+    check("E2 不可测钉扎冲突结案", act6 is Action.DONE
+          and "不可测与钉扎冲突" in e6.verdict.title
+          and "d.jar" in e6.verdict.culprit)
+    # E3: 基准不可测 + 钉禁在场 → 不提前结案(重测留"钉掉问题"通路)
+    e7 = BisectEngine(g2)
+    e7.pin_toggle(frozenset({"d.jar"}), False)  # BASELINE 相位可钉
+    act7 = e7.report(Answer.UNTESTED, frozenset())
+    check("E3 基准不可测+钉禁→重测", act7 is Action.RETEST_SAME
+          and e7.phase is Phase.BASELINE)
+
+    # --- F: 钉扎事件会话重放(v4 显式事件确定性重建) ---
+    e8 = BisectEngine(graph)
+    e8.report(Answer.PRESENT, frozenset())
+    e8.pin_toggle(frozenset({"z.jar"}), False)  # 钉禁留态(不推进二分)
+    session_mod.SESSIONS_DIR = os.path.join(tmp, "sessions-pin")
+    res2 = scan_mods_dir(os.path.join(tmp, "mods2"), cfg)
+    path = session_mod.save_session(res2, e8)
+    check("F 保存成功", path is not None and os.path.isfile(path))
+    rr = session_mod.restore_session(path, cfg)
+    check("F 恢复ok", rr.ok, rr.reason)
+    if rr.ok:
+        check("F 钉扎态重放一致", rr.engine.pinned == e8.pinned
+              and rr.engine.pinned_off == e8.pinned_off)
+        check("F 相位嫌疑轮次一致", rr.engine.phase is e8.phase
+              and set(rr.engine.suspects) == set(e8.suspects)
+              and rr.engine.round_index == e8.round_index)
+        check("F 历史长度一致", len(rr.engine.history) == len(e8.history))
+
+    # --- G: VERIFY 门禁(拒新钉/放行撤钉; 白盒直入验证态) ---
+    # 集成触发依赖二分半侧顺序(实现细节) → 白盒直构单嫌疑验证态,
+    # 门禁语义本身与进入路径无关; 集成侧由 D/D2/manual_freeze 覆盖。
+    e_g = BisectEngine(graph)
+    e_g.report(Answer.PRESENT, frozenset())
+    e_g.pin_toggle(frozenset({"w.jar"}), True)
+    e_g._suspect_units = {e_g.graph.unit_of["w.jar"]}
+    e_g.phase = Phase.VERIFY
+    check("G 验证目标含钉启",
+          "w.jar" in set(e_g.current_plan.target_enabled))
+    check("G VERIFY拒新钉", e_g.pin_toggle(frozenset({"w.jar"}), False)
+          == frozenset() and e_g.pinned_on == frozenset({"w.jar"}))
+    u_g = e_g.pin_clear(frozenset({"w.jar"}))
+    check("G VERIFY放行撤钉", u_g == frozenset({"w.jar"})
+          and e_g.pinned == frozenset() and e_g.phase is Phase.VERIFY)
+
+
 # ---------------------------------------------------------------- main
 
 def main() -> int:
@@ -925,6 +1091,7 @@ def main() -> int:
         test_engine_obstruct(graph)
         test_engine_obstruct_degenerate(cfg)
         test_engine_manual_freeze(graph, tmp, cfg)
+        test_engine_pins(graph, tmp, cfg)
         test_executor(res2, cfg)
         test_session(tmp, cfg)
         test_sortkey()

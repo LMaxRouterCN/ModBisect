@@ -22,7 +22,7 @@ from .depgraph import DependencyGraph
 from .engine import Answer, BisectEngine, ScanSpec
 from .scanner import ScanResult, scan_mods_dir
 
-SESSION_VERSION = 3  # v0.5.2: history 加 kind/jars(手动冻结显式事件); v1/v2 旧会话仍可恢复
+SESSION_VERSION = 4  # v0.6: history 加 pin_on/pin_off/pin_clear(手动钉扎显式事件); v1-v3 旧会话仍可恢复
 
 
 @dataclass
@@ -45,7 +45,7 @@ def _record_item(r) -> dict:
         "kind": r.kind,
     }
     if r.kind != "round":
-        # 手动冻结/解冻事件: 附 jar 集, 重放时直接调引擎公共体
+        # 手动冻结/解冻/钉扎事件: 附 jar 集, 重放时直接调引擎公共体
         item["jars"] = sorted(r.jars)
     return item
 
@@ -105,7 +105,8 @@ def list_sessions() -> list[dict]:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if data.get("version") not in (1, SESSION_VERSION):
+            if data.get("version") not in (1, 3, SESSION_VERSION):
+                # v3(钉扎前)会话仍可列出; v2 同旧行为不列出
                 continue  # 未来版本的会话: 跳过而不是硬解析
             out.append({
                 "path": path,
@@ -127,7 +128,7 @@ def restore_session(path: str, cfg: AppConfig) -> RestoreResult:
             data = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
         return RestoreResult(ok=False, reason=f"会话文件不可读: {e}")
-    if data.get("version") not in (1, 2, SESSION_VERSION):
+    if data.get("version") not in (1, 2, 3, SESSION_VERSION):
         return RestoreResult(ok=False, reason="会话版本不兼容")
 
     # 重扫当前目录(当前启停态可以与会话不同: 中断时正处于二分中间态)
@@ -174,6 +175,14 @@ def restore_session(path: str, cfg: AppConfig) -> RestoreResult:
                 engine.freeze(jars)
             else:
                 engine.unfreeze(jars)
+            continue
+        # v0.6: 手动钉扎显式事件重放(公共体, 钉扎记账确定式重建)
+        if kind in ("pin_on", "pin_off"):
+            engine.pin_toggle(frozenset(rec.get("jars", [])),
+                              kind == "pin_on")
+            continue
+        if kind == "pin_clear":
+            engine.pin_clear(frozenset(rec.get("jars", [])))
             continue
         crashed = bool(rec.get("crashed")) or rec.get("answer") == "invalid"
         # 崩溃轮的 answer 字段值无意义("invalid" 非 Answer 成员), 填什么都被 crashed 分支忽略

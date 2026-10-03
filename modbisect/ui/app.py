@@ -24,7 +24,8 @@ from PySide6.QtCore import QByteArray, QObject, Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QAbstractItemView, QFileDialog, QHBoxLayout,
                                QHeaderView, QInputDialog, QLabel, QLineEdit,
-                               QMainWindow, QMessageBox, QPlainTextEdit,
+                               QMainWindow, QMenu, QMessageBox,
+                               QPlainTextEdit,
                                QPushButton, QSplitter, QTableWidget, QTableWidgetItem,
                                QVBoxLayout, QWidget)
 
@@ -45,7 +46,7 @@ from .dialogs import RepairDialog, SnapshotDialog, VerdictDialog
 from ..engine import ScanSpec  # v0.4: 卷帘规格(装配见 _build_engine)
 from PySide6.QtWidgets import QComboBox, QSpinBox  # v0.4: 模式/步长
 from .panels import DepPanel
-from .style import BORDER, GOLD, GREEN, ORANGE, TEXT_DIM, YELLOW
+from .style import BORDER, GOLD, GREEN, ORANGE, RED, TEXT_DIM, YELLOW  # v0.6: RED(钉禁)
 
 
 class UiState(Enum):
@@ -180,8 +181,17 @@ class MainWindow(QMainWindow):
         row1.addWidget(self._btn_resume)
         root.addLayout(row1)
 
-        # 行2: 进度指示(主控按钮已移驻右列)
+        # 行2: 过滤框(v0.6 需求 ①) + 进度指示(主控按钮已移驻右列)
         row2 = QHBoxLayout()
+        self._edit_filter = QLineEdit()
+        self._edit_filter.setPlaceholderText("过滤: 名称或拼音…")
+        self._edit_filter.setFixedWidth(220)  # 固定宽: 不挤右侧进度标签
+        self._edit_filter.setClearButtonEnabled(True)
+        self._edit_filter.setToolTip(
+            "按名称子串或拼音键过滤表格(空 = 全部显示);\n"
+            "排序或刷新后过滤条件自动重放")
+        self._edit_filter.textChanged.connect(self._on_filter_changed)
+        row2.addWidget(self._edit_filter)
         row2.addStretch(1)
         self._lbl_round = QLabel("—")
         row2.addWidget(self._lbl_round)
@@ -190,6 +200,9 @@ class MainWindow(QMainWindow):
         self._lbl_frozen = QLabel("")  # v0.5: 冻结阻碍计数(无冻结时空)
         self._lbl_frozen.setStyleSheet(f"color: {ORANGE};")  # 呼应表格◆橙
         row2.addWidget(self._lbl_frozen)
+        self._lbl_pinned = QLabel("")  # v0.6: 钉扎计数(无钉时空, 同冻结)
+        self._lbl_pinned.setStyleSheet(f"color: {GOLD};")
+        row2.addWidget(self._lbl_pinned)
         root.addLayout(row2)
 
         # 状态行
@@ -213,6 +226,12 @@ class MainWindow(QMainWindow):
         self._table.setSortingEnabled(True)
         header.setSortIndicator(1, Qt.SortOrder.AscendingOrder)  # 默认名称升序
         self._table.cellDoubleClicked.connect(self._on_cell_double)  # 需求 3/4
+        # v0.6: 右键钉扎菜单(需求 ②); 表头排序变更后行隐藏态随行号
+        # 漂移(行隐藏是行号属性而非行身份属性) → 过滤条件须重放
+        self._table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._on_table_context)
+        header.sortIndicatorChanged.connect(self._on_sort_changed)
         self._table.itemSelectionChanged.connect(self._on_table_selection)  # v0.3: 左树联动
         root.addWidget(self._table, stretch=3)
 
@@ -403,11 +422,12 @@ class MainWindow(QMainWindow):
         self._log_view.appendPlainText(msg)  # 引用改名后的控件(勿回退)
 
     def _refresh_indicators(self) -> None:
-        """轮次/嫌疑数/冻结数标签(v0.5 增冻结)。"""
+        """轮次/嫌疑数/冻结数/钉扎数标签(v0.5 冻结; v0.6 钉扎)。"""
         if self._engine is None:
             self._lbl_round.setText("—")
             self._lbl_suspects.setText("—")
             self._lbl_frozen.setText("")
+            self._lbl_pinned.setText("")
         else:
             self._lbl_round.setText(f"轮次 {self._engine.round_index}")
             self._lbl_suspects.setText(
@@ -415,6 +435,19 @@ class MainWindow(QMainWindow):
             self._lbl_frozen.setText(  # v0.5: 冻结计数(无冻结时留空)
                 f"冻结 {len(self._engine.frozen)} 个"
                 if self._engine.frozen else "")
+            pinned = self._engine.pinned  # v0.6: 钉扎计数 + 成员 tooltip
+            if pinned:
+                self._lbl_pinned.setText(f"钉 {len(pinned)} 个")
+                self._lbl_pinned.setToolTip(
+                    "钉扎(会话中手动锁定): "
+                    + ", ".join(sorted(pinned))
+                    + "\n钉禁 = 恒禁用(状态列红) / 钉启 = 恒启用(绿)"
+                    "\n右键行菜单 / 双击状态列管理")
+            else:
+                self._lbl_pinned.setText("")
+                self._lbl_pinned.setToolTip(
+                    "钉扎: 会话中手动锁定 mod 启停"
+                    "\n右键行菜单 / 双击状态列管理")
 
     def _restore_ui_prefs(self) -> None:
         """启动恢复 UI 偏好(需求 6): 窗口几何 / 表头状态 / 最后目录。"""
@@ -587,6 +620,9 @@ class MainWindow(QMainWindow):
             return
         suspects = self._engine.suspects if self._engine else frozenset()
         frozen = self._engine.frozen if self._engine else frozenset()
+        # v0.6: 钉扎两集(状态列钉禁红/钉启绿)
+        pin_off = self._engine.pinned_off if self._engine else frozenset()
+        pin_on = self._engine.pinned_on if self._engine else frozenset()
         before = self._selected_bases()  # 身份锚: 刷新前选中集
         header = self._table.horizontalHeader()
         sort_col = header.sortIndicatorSection()
@@ -604,7 +640,7 @@ class MainWindow(QMainWindow):
             self._table.setSortingEnabled(False)  # 填充期禁排序(逐行插入会跳行)
             self._table.setRowCount(len(jars))  # 就地=同数无操作; 重建=扩缩行
             for row, j in enumerate(jars):
-                self._fill_row(row, j, suspects, frozen)
+                self._fill_row(row, j, suspects, frozen, pin_off, pin_on)
             self._table.setSortingEnabled(True)
             if can:
                 self._table.sortItems(sort_col, sort_order)  # 键变强制重排
@@ -628,13 +664,21 @@ class MainWindow(QMainWindow):
             self._panel.refresh()  # 画框状态同步(启停变化后)
         if self._tree is not None:
             self._tree.refresh()  # v0.3 左树状态着色同步(启停变化后)
+        # v0.6: 尾部重放过滤 — 就地/重建后行隐藏态归零(行号属性),
+        # 当前过滤条件继续生效; 排序换位由 _on_sort_changed 即时重放
+        self._on_filter_changed(self._edit_filter.text())
 
-    def _fill_row(self, row: int, j, suspects, frozen) -> None:
+    def _fill_row(self, row: int, j, suspects, frozen,
+                  pin_off, pin_on) -> None:
         """单行填充(全量/就地共用): v0.3.1 从 _refresh_table 抽取; v0.5 冻结◆(橙)。"""
         nkey = name_key(j.label)  # 名称拼音键(需求 1)
+        # v0.6: 钉扎覆盖状态格文案(引擎意志优先于磁盘态; 未落盘的
+        # 暂态差由下轮 apply 自然对齐); 排序键仍按磁盘态(需求 1 不变)
+        status = ("钉禁" if j.base_name in pin_off else
+                  "钉启" if j.base_name in pin_on else
+                  ("启用" if j.enabled else "禁用"))
         items = [
-            self._mk_item("启用" if j.enabled else "禁用",
-                          (j.enabled, nkey), base=j.base_name),
+            self._mk_item(status, (j.enabled, nkey), base=j.base_name),
             self._mk_item(j.label, nkey),
             self._mk_item(j.mtime_str, (j.mtime, nkey)),  # 需求 2: 最后修改
             self._mk_item(j.version, (version_key(j.version), nkey)),
@@ -649,6 +693,11 @@ class MainWindow(QMainWindow):
                 it.setForeground(QColor(TEXT_DIM))
         else:
             items[0].setForeground(QColor(GREEN))  # 启用状态绿(需求 9)
+        # v0.6: 钉扎色覆盖状态格(钉禁红/钉启绿 — 恒定意志的显式区分)
+        if j.base_name in pin_off:
+            items[0].setForeground(QColor(RED))
+        elif j.base_name in pin_on:
+            items[0].setForeground(QColor(GREEN))
         if j.base_name in frozen:
             # v0.5 冻结: 橙◆(恒启用钉死的启动阻碍, 非嫌疑)
             items[5].setForeground(QColor(ORANGE))
@@ -657,6 +706,28 @@ class MainWindow(QMainWindow):
             items[5].setForeground(QColor(YELLOW))  # 嫌疑标记黄(需求 9)
         for i, it in enumerate(items):
             self._table.setItem(row, i, it)
+
+    def _on_filter_changed(self, text: str) -> None:
+        """过滤框(v0.6 需求 ①): 名称子串 + 拼音键子串双通道。
+
+        拼音键取自名称列排序键(填充时已预计算, 零重复计算);
+        空 = 全显; 逐行 setRowHidden 与排序正交。
+        """
+        t = text.strip().lower()
+        for r in range(self._table.rowCount()):
+            if not t:
+                self._table.setRowHidden(r, False)
+                continue
+            it = self._table.item(r, 1)  # 名称列(文本+拼音键双载荷)
+            label = it.text() if it is not None else ""
+            nkey = ("" if it is None
+                    else str(it.data(Qt.ItemDataRole.UserRole) or ""))
+            self._table.setRowHidden(
+                r, not (t in label.lower() or t in nkey.lower()))
+
+    def _on_sort_changed(self, col, order) -> None:
+        """表头排序变更: 行隐藏态随行号漂移 → 按当前过滤条件重放。"""
+        self._on_filter_changed(self._edit_filter.text())
 
     def _selected_bases(self) -> set[str]:
         """当前选中行的身份集(刷新前后选中恢复的锚, v0.3.1)。"""
@@ -748,7 +819,8 @@ class MainWindow(QMainWindow):
             self._tree.show_for(base)
 
     def _on_cell_double(self, row: int, col: int) -> None:
-        """双击分发: 状态列 = 级联启停(需求 3); 其他列 = 依赖画框(需求 4)。"""
+        """双击分发: 状态列 = 级联启停(需求 3, 空闲/终局态) /
+        智能钉扎(v0.6 需求 ②, 会话中); 其他列 = 依赖画框(需求 4)。"""
         item = self._table.item(row, 0)  # 行身份恒由状态列携带
         if item is None:
             return
@@ -756,7 +828,15 @@ class MainWindow(QMainWindow):
         if not base:
             return
         if col == 0:
-            self._toggle_cascade(base)
+            # v0.6: 会话中(引擎在场且未终局)状态列双击 = 智能钉扎
+            # (需求 ②); 空闲/终局态仍是磁盘层级联启停(需求 3)
+            if (self._engine is not None
+                    and self._state is not UiState.IDLE
+                    and self._state is not UiState.SCANNING
+                    and self._state is not UiState.DONE):
+                self._smart_pin(base)
+            else:
+                self._toggle_cascade(base)
         else:
             self._show_dep_panel(base)
 
@@ -985,6 +1065,7 @@ class MainWindow(QMainWindow):
             return
         # 用户在崩溃警告下仍作答 = 用户自主确认本轮信号有效
         frozen_before = self._engine.frozen  # v0.5: 冻结增量观测(日志)
+        pins_before = self._engine.pinned  # v0.6: 冻结吞钉增量观测(日志)
         action = self._engine.report(
             answer, self._last_report.actual_disabled, crashed=False)
         if self._engine.frozen != frozen_before:
@@ -992,6 +1073,10 @@ class MainWindow(QMainWindow):
             self._log("[冻结] " + ", ".join(sorted(
                 self._engine.frozen - frozen_before))
                 + " (恒启用钉死, 不再参与启停二分)")
+        if self._engine.pinned != pins_before:
+            # v0.6: 自动冻结吞并钉扎(恒启用优先, 连根拔不可推导) — 入册
+            self._log("[钉扎] 被冻结吞并: " + ", ".join(sorted(
+                pins_before - self._engine.pinned)) + " (恒启用优先)")
         save_session(self._scan, self._engine)
         if action is Action.DONE:
             self._finish()
@@ -1043,6 +1128,7 @@ class MainWindow(QMainWindow):
         bases = frozenset(self._selected_bases())
         if not bases:
             return
+        pins_before = self._engine.pinned  # v0.6: 冻结吞钉增量观测(日志)
         touched = (self._engine.freeze(bases) if kind == "freeze"
                    else self._engine.unfreeze(bases))
         if not touched:
@@ -1050,6 +1136,10 @@ class MainWindow(QMainWindow):
             return
         self._log(("[冻结] " if kind == "freeze" else "[解冻] ")
                   + ", ".join(sorted(touched)))
+        if self._engine.pinned != pins_before:
+            # v0.6: 冻结吞并钉扎(恒启用优先) — 增量入册
+            self._log("[钉扎] 被冻结吞并: " + ", ".join(sorted(
+                pins_before - self._engine.pinned)) + " (恒启用优先)")
         self._refresh_table()
         save_session(self._scan, self._engine)
         self._after_manual(kind)
@@ -1101,6 +1191,108 @@ class MainWindow(QMainWindow):
         self._last_report = report  # v0.5.2 归算基准统一到 actual
         self._refresh_table()
         self._set_state(self._state, "冻结复原完成, 继续作答")
+
+    # -------------------------------------------------- 手动钉扎(v0.6)
+
+    def _pin_toggle(self, bases, enable: bool) -> None:
+        """钉扎公共入口: 引擎记账 + 日志 + 状态分流(仿 _manual_toggle)。
+
+        钉禁 = 恒禁用(留嫌疑池参与归因); 钉启 = 恒启用(不动调度)。
+        引擎门禁(OBSTRUCT/VERIFY/DONE)在此提示双保险。
+        """
+        if self._apply_busy or self._engine is None:
+            return
+        if self._engine.phase in (Phase.OBSTRUCT, Phase.VERIFY, Phase.DONE):
+            self._log(f"[钉扎] 当前相位({self._engine.phase.value})"
+                      "不接受钉扎")
+            return
+        touched = self._engine.pin_toggle(frozenset(bases), enable)
+        if not touched:
+            self._log("[钉扎] 无有效目标(不在工作域/冲突/幂等)")
+            return
+        self._log(("[钉启] " if enable else "[钉禁] ")
+                  + ", ".join(sorted(touched)))
+        self._refresh_table()
+        self._refresh_indicators()
+        save_session(self._scan, self._engine)
+        self._after_pin()
+
+    def _pin_clear_ui(self, bases) -> None:
+        """撤销钉扎入口(引擎侧 VERIFY 放行 — 撤销可恢复隔离纯度)。"""
+        if self._apply_busy or self._engine is None:
+            return
+        touched = self._engine.pin_clear(frozenset(bases))
+        if not touched:
+            self._log("[撤钉] 无钉可撤(不在工作域/相位禁止)")
+            return
+        self._log("[撤钉] " + ", ".join(sorted(touched)))
+        self._refresh_table()
+        self._refresh_indicators()
+        save_session(self._scan, self._engine)
+        self._after_pin()
+
+    def _smart_pin(self, base: str) -> None:
+        """状态列双击(v0.6): 未钉 → 按磁盘态反向钉; 已钉 → 撤销。
+
+        反向钉延续双击的「翻转」直觉: 启用行钉禁(用户怀疑它),
+        禁用行钉启(用户需要它); 已钉行双击 = 撤销回归引擎调度。
+        """
+        if self._engine is None:
+            return
+        if base in self._engine.pinned:
+            self._pin_clear_ui(frozenset({base}))
+            return
+        jar = next((j for j in self._scan.jars
+                    if j.base_name == base), None)
+        if jar is None:
+            return
+        self._pin_toggle(frozenset({base}), not jar.enabled)
+
+    def _after_pin(self) -> None:
+        """钉扎后的状态分流(引擎记账完成, 盘面未动)。
+
+        WAIT_LAUNCH: 重开轮立即吸收(旧计划作废, 同冻结语义);
+        其余相位(JUDGING/WAIT_GAME/READY)只记账: 下轮计划自然吸收,
+        本轮归算仍按已落盘的实际禁用集(钉扎不掺水)。
+        钉扎不触嫌疑池 → 无冻结的排空结案通路(无需 DONE 分支)。
+        """
+        if self._state is UiState.WAIT_LAUNCH:
+            self._begin_round()
+            return
+        self._set_state(self._state, "钉扎已记录, 下轮计划生效")
+
+    def _on_table_context(self, pos) -> None:
+        """右键菜单(v0.6): 钉禁/钉启/撤销 — 会话中(引擎在场)才提供。"""
+        if self._engine is None:
+            return  # 空闲态无钉扎语义(级联双击已覆盖自由开关)
+        if not self._table.indexAt(pos).isValid():
+            return  # 空白区不弹(零噪声)
+        bases = self._selected_bases()
+        if not bases:
+            return
+        menu = QMenu(self)
+        # 动作身份挂 property(exec 返回的 QAction 包装不保证同一性,
+        # 文案前缀匹配在文案改动时易碎); 分发逻辑独立成方法可直测
+        a_off = menu.addAction(f"钉禁 {len(bases)} 个(恒禁用, 留嫌疑)")
+        a_off.setProperty("pin_choice", 0)
+        a_on = menu.addAction(f"钉启 {len(bases)} 个(恒启用)")
+        a_on.setProperty("pin_choice", 1)
+        a_clr = menu.addAction("撤销钉扎")
+        a_clr.setProperty("pin_choice", 2)
+        a_clr.setEnabled(bool(bases & self._engine.pinned))
+        act = menu.exec(self._table.viewport().mapToGlobal(pos))
+        if act is None:
+            return
+        self._pin_menu_dispatch(bases, act.property("pin_choice"))
+
+    def _pin_menu_dispatch(self, bases, choice) -> None:
+        """钉扎菜单分发(与模态 exec 解耦, 可直测): 0 钉禁/1 钉启/2 撤销。"""
+        if choice == 0:
+            self._pin_toggle(bases, False)
+        elif choice == 1:
+            self._pin_toggle(bases, True)
+        elif choice == 2:
+            self._pin_clear_ui(bases)
 
     # ---------------------------------------------------------------- 轮次循环
 

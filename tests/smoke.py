@@ -430,6 +430,57 @@ def main() -> int:
         app.processEvents()
         check("模式复位", win._cfg.ui_scan_mode == "bisect")
 
+        # ---- 12.55 钉扎与过滤(v0.6): 过滤框双通道 + 钉扎往返净零 ----
+        # 12.5 尾态: BISECT WAIT_LAUNCH(引擎在场, 非门禁相位)
+        before_pin = _disabled_on_disk(mods)
+        check("钉扎标签空态", win._lbl_pinned.text() == "")
+        # 过滤框(需求 ①): 名称子串通道
+        win._edit_filter.setText("mod7")
+        app.processEvents()
+        vis = [win._table.item(r, 0).data(_JAR_ROLE)
+               for r in range(win._table.rowCount())
+               if not win._table.isRowHidden(r)]
+        check("过滤名称通道 mod7", vis == ["m7.jar"], str(vis))
+        # 排序变更 → 行号漂移 → 过滤重放(隐藏态跟身份不跟行号)
+        hh.setSortIndicator(0, Qt.SortOrder.AscendingOrder)
+        app.processEvents()
+        vis = [win._table.item(r, 0).data(_JAR_ROLE)
+               for r in range(win._table.rowCount())
+               if not win._table.isRowHidden(r)]
+        check("排序变更后过滤重放", vis == ["m7.jar"], str(vis))
+        hh.setSortIndicator(1, Qt.SortOrder.AscendingOrder)  # 回名称序
+        app.processEvents()
+        win._edit_filter.clear()
+        app.processEvents()
+        check("清空过滤全显", all(not win._table.isRowHidden(r)
+                                  for r in range(win._table.rowCount())))
+        # 钉启(菜单分发): WAIT_LAUNCH 重开轮吸收(overlay 并入启用侧)
+        win._pin_menu_dispatch(frozenset({"m7.jar"}), 1)
+        _wait_state(win, "wait_launch", 10.0)
+        check("钉启入账", win._engine.pinned_on == frozenset({"m7.jar"}))
+        check("钉扎计数标签", "钉 1 个" in win._lbl_pinned.text())
+        check("钉启状态格文案", win._table.item(
+            _row_of(win, "m7.jar"), 0).text() == "钉启")
+        check("重开轮计划吸收钉启",
+              "m7.jar" in set(win._current_plan.target_enabled))
+        # 已钉行双击 = 撤销(智能钉反向)
+        win._on_cell_double(_row_of(win, "m7.jar"), 0)
+        app.processEvents()
+        _wait_state(win, "wait_launch", 10.0)
+        check("双击撤销钉扎", win._engine.pinned == frozenset()
+              and win._lbl_pinned.text() == "")
+        # 未钉启用行双击 = 反向钉禁(智能钉); 再双击撤销
+        win._on_cell_double(_row_of(win, "m7.jar"), 0)
+        app.processEvents()
+        _wait_state(win, "wait_launch", 10.0)
+        check("双击智能钉禁", win._engine.pinned_off == frozenset({"m7.jar"})
+              and win._table.item(_row_of(win, "m7.jar"), 0).text() == "钉禁")
+        win._on_cell_double(_row_of(win, "m7.jar"), 0)
+        app.processEvents()
+        _wait_state(win, "wait_launch", 10.0)
+        check("钉扎往返净零扰动", win._engine.pinned == frozenset()
+              and _disabled_on_disk(mods) == before_pin)
+
         # ---- 12.6 阻碍子流程(v0.5): 未测试→可测性子二分→冻结→回主 ----
         # 12.5 尾态: SCAN 锁段后 BISECT(S={m0..m3}), 本轮计划禁 {m2,m3}
         # [长期记忆: 010] 断言全部派生自 plan/engine 属性(不锚单元索引序)
