@@ -37,7 +37,8 @@ sys.stdout.reconfigure(encoding="utf-8")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt                      # noqa: E402
-from PySide6.QtWidgets import QApplication, QLabel  # noqa: E402
+from PySide6.QtWidgets import (QApplication, QLabel,  # noqa: E402
+                                  QMessageBox)
 
 import modbisect.snapshots as snap_mod            # noqa: E402
 import modbisect.ui.app as app_mod                # noqa: E402
@@ -45,8 +46,8 @@ from modbisect import session as session_mod      # noqa: E402
 from modbisect.config import AppConfig            # noqa: E402
 from modbisect.engine import Phase, Verdict       # noqa: E402
 from modbisect.ui.app import MainWindow           # noqa: E402
-from modbisect.ui.dialogs import (RepairDialog, SnapshotDialog,  # noqa: E402
-                                  VerdictDialog)
+from modbisect.ui.dialogs import (RepairDialog, RecheckDialog,  # noqa: E402
+                                  SnapshotDialog, VerdictDialog)
 
 # closeEvent 持久化打桩: 冒烟绝不写真实 config.json
 # (cfg 字段赋值照常发生, 持久化逻辑可被断言)
@@ -363,9 +364,17 @@ def main() -> int:
         _wait_state(win, "wait_launch", 10.0)
         dis = _disabled_on_disk(mods)
         check("二分轮 3 禁 1 个", len(dis) == 1, str(dis))
-        # 轮 3 判决: PRESENT → S={m0} 单单元 → 引擎转 VERIFY
+        # 轮 3 判决: PRESENT → S={m0} 单单元 → v0.7 停 CONVERGED
+        # (收敛待决: 三选一组接管, 显式选「就地隔离验证」才开验证轮)
         win._on_debug_fake_game()
         win._on_judge_present()
+        check("轮3后停收敛", win._engine.phase is Phase.CONVERGED,
+              str(win._engine.phase))
+        check("收敛停判读态", win._state.value == "judging")
+        check("三选一组接管", win._btn_conv_verify.isVisible()
+              and win._btn_conv_recheck.isVisible())
+        check("主判读组退场", not win._btn_judge_present.isVisible())
+        win._on_conv_verify()
         _wait_state(win, "wait_launch", 10.0)
         check("验证轮计划", win._current_plan.phase is Phase.VERIFY)
         dis = _disabled_on_disk(mods)
@@ -502,9 +511,14 @@ def main() -> int:
         check("主判决组退场", not win._btn_judge_present.isVisible()
               and not win._btn_judge_untested.isVisible())
         win._on_judge_untestable()  # 确认阻碍=被禁候选 → 冻结
-        _wait_state(win, "wait_launch", 10.0)
+        _wait_state(win, "judging", 10.0)  # v0.7: 冻结排空 → 停收敛判读态
         check("冻结=本轮被禁候选", win._engine.frozen
               == frozenset(p_half.proposed_disabled))
+        # v0.7: 冻结排空嫌疑到单单元 → 停 CONVERGED(非旧版直转 VERIFY),
+        # 显式选「就地隔离验证」续走验证轮
+        check("冻结排空后停收敛", win._engine.phase is Phase.CONVERGED)
+        win._on_conv_verify()
+        _wait_state(win, "wait_launch", 10.0)
         check("冻结后单嫌疑进验证", win._current_plan.phase is Phase.VERIFY)
         check("验证目标=嫌疑支撑∪冻结",
               set(win._current_plan.target_enabled)
@@ -533,6 +547,115 @@ def main() -> int:
         win._on_debug_fake_game()
         check("手动宣布退出进 JUDGING", win._state.value == "judging")
         check("procmon 被直通吞停", not win._procmon.tracking)
+
+        # ---- 12.8 复测全链(v0.7): 收敛 → 干净实例导出 → 双答 → 终局 ----
+        # 12.7 尾态: VERIFY 轮 JUDGING 未作答。三段:
+        # ① 验证轮 ABSENT 结清(隔离不复现出口);
+        # ② 全新会话收敛 → 复测导出 → PRESENT → 确诊 + 清理提醒;
+        # ③ 单元域(mods2)收敛 → 复测导出 → ABSENT → 域尽防御结案。
+        # 桩(同 359 惯例): RecheckDialog.exec 模拟「选根+勾 config」;
+        # VerdictDialog.exec 模拟「保持当前状态」(383 已 del, 此处重挂);
+        # app_mod.QMessageBox 换替身劫持 information(同 53 行桩法)。
+        VerdictDialog.exec = lambda self: True
+        clean1 = os.path.join(tmp, "clean1")
+        clean2 = os.path.join(tmp, "clean2")
+        os.makedirs(clean1)
+        os.makedirs(clean2)
+        # 源实例 config 材料: mod0 前缀命中 / zzz 干扰项不拷
+        os.makedirs(os.path.join(tmp, "config"), exist_ok=True)
+        for _cfg_name in ("mod0-common.toml", "zzz-decoy.toml"):
+            with open(os.path.join(tmp, "config", _cfg_name), "w") as f:
+                f.write("x")
+        _rc_root = {"root": clean1}  # 桩参数通道: 当前轮导出目标根
+
+        def _rc_exec(self):
+            self.instance_root = _rc_root["root"]
+            self._cfg_check.setChecked(True)  # 模拟勾选「附带 config」
+            return True
+        RecheckDialog.exec = _rc_exec
+        _info_calls = []  # 清理提醒弹窗记录(终局 QMessageBox.information)
+
+        class _MBStub(app_mod.QMessageBox):  # 只劫持 information, 余承真类
+            @staticmethod
+            def information(*a, **k):
+                _info_calls.append(a)
+        _real_mb = app_mod.QMessageBox
+        app_mod.QMessageBox = _MBStub
+
+        # ① 验证轮 ABSENT: 隔离不复现 → 噪声结案(12.7 尾轮收口)
+        win._on_judge_absent()
+        app.processEvents()
+        check("验证未复现结案", win._state.value == "ready"
+              and win._engine is None)
+        check("验证未复现入册", "[终局]" in win._log_view.toPlainText())
+
+        # ② 全新会话: 基准 + 二分轮 1/2 全 PRESENT(禁半/禁 2)
+        win._on_start()
+        _wait_state(win, "wait_launch", 10.0)
+        for _i in range(3):
+            win._on_debug_fake_game()
+            win._on_judge_present()
+            _wait_state(win, "wait_launch", 10.0)
+        win._on_debug_fake_game()
+        win._on_judge_present()  # 轮 3 PRESENT → S={m0} 单单元收敛
+        check("复测链收敛停", win._engine.phase is Phase.CONVERGED)
+        check("复测链停判读态", win._state.value == "judging")
+        win._on_conv_recheck()  # 「干净实例复测」→ 导出弹窗(桩即选根)
+        _wait_status(win, "复测轮", 10.0)  # 等后台导出完成进双答态
+        check("复测相位", win._engine.phase is Phase.RECHECK)
+        check("复测双答组接管", win._btn_rc_present.isVisible()
+              and win._btn_rc_reexport.isVisible())
+        check("收敛三选一退场", not win._btn_conv_verify.isVisible())
+        _c1m = os.path.join(clean1, "mods")
+        check("复测包 mods 落地", os.path.isdir(_c1m)
+              and os.listdir(_c1m) == ["m0.jar"],
+              str(os.listdir(_c1m) if os.path.isdir(_c1m) else "NO-DIR"))
+        check("复测包 config 前缀命中", os.path.isfile(
+            os.path.join(clean1, "config", "mod0-common.toml")))
+        check("复测包 config 干扰不拷", not os.path.exists(
+            os.path.join(clean1, "config", "zzz-decoy.toml")))
+        check("复测偏好即时持久化", win._cfg.ui_last_recheck_dir == clean1
+              and win._cfg.ui_recheck_include_config is True)
+        check("复测导出日志", "已导出 1 个 mod" in win._log_view.toPlainText())
+        win._on_rc_present()  # 干净实例复现 → 确诊(出口一)
+        app.processEvents()
+        check("复测确诊结案", win._state.value == "ready"
+              and win._engine is None)
+        check("复测确诊标题入册", "干净实例复现" in win._log_view.toPlainText())
+        check("复测清理提醒弹窗", len(_info_calls) == 1)
+        check("复测清理提醒入册", "复测包仍留在干净实例"
+              in win._log_view.toPlainText())
+
+        # ③ 单元域: 重扫 mods2(仅 1 jar) → 基准在场即收敛 → ABSENT 域尽
+        mods2 = os.path.join(tmp, "mods2")
+        os.makedirs(mods2)
+        make_jar(os.path.join(mods2, "a.jar"), "moda")
+        win._dir_edit.setText(mods2)
+        win._on_scan()
+        _wait_state(win, "ready", 5.0)
+        win._on_start()
+        _wait_state(win, "wait_launch", 10.0)
+        win._on_debug_fake_game()
+        win._on_judge_present()  # 域内唯一嫌疑 → 基准即收敛
+        check("单元域基准即收敛", win._engine.phase is Phase.CONVERGED)
+        _rc_root["root"] = clean2  # 桩切第二个干净实例
+        win._on_conv_recheck()
+        _wait_status(win, "复测轮", 10.0)
+        _c2m = os.path.join(clean2, "mods")
+        check("cycle2 复测包落地", os.path.isdir(_c2m)
+              and os.listdir(_c2m) == ["a.jar"],
+              str(os.listdir(_c2m) if os.path.isdir(_c2m) else "NO-DIR"))
+        win._on_rc_absent()  # 嫌疑独立无害 → 排除 → 域尽防御(出口二)
+        app.processEvents()
+        check("域尽防御结案", win._state.value == "ready"
+              and win._engine is None)
+        check("域尽防御标题入册", "组合成因未复现"
+              in win._log_view.toPlainText())
+        check("二次清理提醒", len(_info_calls) == 2)
+        # 桩还原(类/模块属性: 不还原会污染后续节与同进程行为)
+        del RecheckDialog.exec
+        del VerdictDialog.exec
+        app_mod.QMessageBox = _real_mb
 
         # ---- 13. 弹窗单元(直构直验, 不 exec) ----
         sd = SnapshotDialog([{"path": "a.json", "created": "t1",
@@ -564,7 +687,7 @@ def main() -> int:
               and not win._procmon.tracking)
         check("几何已持久化", len(cfg.ui_window_geometry) > 10)
         check("表头已持久化", len(cfg.ui_header_state) > 10)
-        check("目录已持久化", cfg.ui_last_mods_dir == mods)
+        check("目录已持久化", cfg.ui_last_mods_dir == mods2)  # 12.8 末次重扫
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"\n冒烟结果: {_PASS} 通过, {_FAIL} 失败")

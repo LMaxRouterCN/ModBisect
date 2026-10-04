@@ -341,3 +341,82 @@ displayName 时名称列 = modId("mod7")而非文件名("m7.jar"), UI
 断言须用显示名文本; ④VERIFY 入口守卫的集成触发依赖二分半侧选择
 顺序(实现细节) → 白盒直测(先例 _frozen_was_suspect), 断言契约
 零顺序敏感。
+
+## v0.7 变更(恒启用闭包 + 收敛三选一: 验证降级为可选项)(2026-10-04)
+
+**根因(真机 6h 会话轮27-40 暴露)**: 恒启用集(冻结∪钉启)是"点集"
+非"闭包集" — 验证/卷帘/可测性三出口均以 `| frozen` 裸点并入启用侧,
+冻结成员的支撑依赖不在保留名单 → 稀疏盘面悬空必崩 → 爆出 463 组
+伪可测性池 → 连环冻结死循环。读原文修正: VERIFY 出口已过 _pin_overlay(行228-231),
+钉启在场; 裸点缺陷仅在支撑闭包, 出口共四处(VERIFY/卷帘双向/
+BISECT/OBSTRUCT), BASELINE 全启用天然免疫。
+
+**A. 恒启用闭包(根修)**:
+- 新原语 support(frozen ∪ pin_on)(含自身) 替换三出口裸点并入
+  (VERIFY 228 / 卷帘启 254 / 卷帘禁 263 / 阻碍 336 / 二分 368, 共五出口;
+BASELINE 全启用天然免疫) + OBSTRUCT _forecast 镜像同减(预报与实际
+脱钩会冻无辜单元); 活锁安全前提: 主流程回捞 ⟹ 池∩support(恒启用)
+=∅ ⟹ 探针永不被中和
+- 回捞差集非空时日志 `[回捞] 冻结/钉启支撑 N 个(闭包补全)`
+- 语义不变量: 钉禁闭包优先级高于回捞(吞钉连根拔已保证
+  frozen ∩ pin_dead闭包 = ∅, 减法无误伤)
+- 实现细则: RoundPlan 增 rescued 字段(回捞集, UI 日志); pin_toggle
+  增冻结成员守卫(钉启已冻结=冗余拒绝, 补真机"二次钉启无反馈");
+  VERIFY 确诊文案附冻结背景注记(恒启用背景在场, 单因判定含背景
+  贡献); _converged_from 存档收敛前相位(复测续查恢复 SCAN/BISECT);
+  config 导出按 modid 前缀 glob(config/<modid>*); AppConfig 增
+  ui_last_recheck_dir / ui_recheck_include_config; 事件 kind 四枚:
+  choice_stop / choice_verify / choice_recheck / recheck
+
+**B. 收敛三选一(验证相位降级为玩家可选)**:
+- 收敛 → Phase.CONVERGED, UI 弹三选一:
+  1. "结束排查" → DONE 结案(罪魁 X, 未经隔离验证)
+  2. "把这个模组(以及他的依赖)放进另一个干净实例中再次测试(需要
+     配置路径)" → 选实例根(记忆到配置) + 拷贝范围二选一("仅模组
+     文件" 默认 / "config和模组文件(不建议)") → executor 导出
+     support(X) 的 jar(+可选 config 按 modid 匹配) → 玩家干净
+     实例测试 → 复现: 定罪结案 culprit={X}; 不复现: 冻结 X +
+     续查(剩余域卷帘/二分, 找共谋者)
+  3. "就在本实例验证(非常不建议)" → 原 VERIFY 流程不变
+- 复测循环(max 追加, 泛化): 每次收敛都走三选一 — 第二个及后续
+  模组同样进复测分支; 复测集合 = 累计排除集 ∪ 新嫌疑(连各自依赖
+  整体进干净实例)。复现 → 共谋结案(culprit = 该集合, 文案 max 原文):
+  "多个模组共同导致的问题：{X, M}
+   禁用其中任意一个问题消失,这属于模组之间的冲突和兼容问题,
+   建议给双方作者同时反馈."
+  不复现 → 冻结该嫌疑 + 续查, 循环往复。终止三出口: 复现结案 /
+  手动结束排查 / 域尽(累计集整体亦未复现 → "组合成因未复现"结案)
+- 续查归算(统一原语, 替代两形态分述): 冻结 X 恒启用后, 共谋
+  问题降维成单因问题(X 恒在场 → 问题在场 ⟺ 搭档在场, 精确非
+  近似) — 续查初值 S = 全量单元域按单因公式(present→−hit /
+  absent→∩hit)逐轮重归算全部历史 round 证据, 再剔除 frozen/
+  excluded 单元。卷帘指针不回退(冻结位天然跳过); 重归算为空 →
+  "组合成因未复现"防御结案。两形态直觉(卷帘续卷搭档必在未卷段/
+  纯二分全量重搜)皆为此重归算的推论
+- 新相位: Phase.CONVERGED(三选一待答) / Phase.RECHECK(干净实例
+  待答); 门禁同 VERIFY(拒新钉, 手动冻结放行)
+
+**C. 会话 v5**: 新事件 kind 四枚(choice_stop/choice_verify/
+choice_recheck/recheck, 后者 answer=present/absent); 路径与拷贝范围
+不入会话, 存 AppConfig 持久; CONVERGED/RECHECK 待答态恢复后
+UI 重弹/重示按钮; v1-v4 旧会话兼容照旧。
+
+**D. 杂项**: [freeze] 拒绝文案小写英文 → 中文统一(与其他日志
+风格一致); 显示名"前置库  xxx"双空格规范。
+
+**测试(core 231 / smoke 141, 2026-10-05 验收全绿)**: core 新增
+(A 闭包三出口 / B CONVERGED 状态机+recheck 双答+二次收敛共谋 /
+C 会话 v5 roundtrip / 冻结吞钉 reattribution); smoke 实况: 12 与
+12.6 收敛停点接入(轮3 present / 冻结排空后停 CONVERGED, 显式选
+「就地隔离验证」续链), 新增 12.8 复测全链三段 — ①验证轮 absent
+噪声结清(12.7 收口); ②全新会话收敛 → RecheckDialog 桩(选根+勾
+config)→后台导出 → 落盘断言(mods 集合 / config 前缀命中, 干扰项
+不拷)+偏好即时持久化 → 复现确诊+终局清理提醒(弹窗+日志双通道);
+③单元域(单 jar)基准 present 即收敛 → 复测 absent → 域尽防御
+结案+二次清理提醒。三选一 STOP/共谋二次收敛分支由 core 覆盖。
+
+**验收补遗(2026-10-05)**: 修 _enter_recheck 轮计划陈旧真 bug —
+conv_recheck/取消/导出失败路径不经 _begin_round, 旧计划相位把
+按钮路由锁死收敛三选一组(复测双答组永不亮); 根修 = 入口刷新
+current_plan(纯推导幂等, _begin_round 路径重取同值零扰动)。
+另确认: 单单元域基准轮 present 直判收敛(免空转二分轮)。

@@ -23,8 +23,9 @@ sys.stdout.reconfigure(encoding="utf-8")
 from modbisect.config import AppConfig
 from modbisect.scanner import scan_mods_dir
 from modbisect.depgraph import DependencyGraph
-from modbisect.engine import (Answer, Action, Phase, BisectEngine,
+from modbisect.engine import (Answer, Action, Choice, Phase, BisectEngine,
                                ScanSpec)
+from modbisect.recheck import recheck_export_names  # v0.7 复测
 from modbisect.executor import Executor
 from modbisect import session as session_mod
 
@@ -271,8 +272,10 @@ def test_engine(graph: DependencyGraph, W: set) -> None:
     # 执行层回报契约: actual = W - 实际目标启用集
     actual = frozenset(W - set(p1.target_enabled))
     act = eng.report(Answer.PRESENT, actual)
-    check("一轮后进VERIFY", act == Action.NEXT_PLAN
-          and eng.phase == Phase.VERIFY)
+    # v0.7: 收敛不再直达 VERIFY, 先停 CONVERGED 待三选一
+    check("一轮后进CONVERGED", act == Action.NEXT_PLAN
+          and eng.phase == Phase.CONVERGED)
+    act = eng.choose(Choice.VERIFY)
     p2 = eng.current_plan
     check("验证目标=嫌疑+支撑", set(p2.target_enabled)
           == set(graph.support({"w.jar"})))
@@ -318,6 +321,8 @@ def test_engine_branches(graph: DependencyGraph, W: set) -> None:
     e6.report(Answer.PRESENT, frozenset())
     p = e6.current_plan
     e6.report(Answer.PRESENT, frozenset(W - set(p.target_enabled)))
+    # v0.7: 收敛三选一, 选 VERIFY 进入隔离验证
+    e6.choose(Choice.VERIFY)
     a = e6.report(Answer.ABSENT, frozenset())
     check("验证不复现→交互", a == Action.DONE
           and e6.verdict is not None and "交互" in e6.verdict.title)
@@ -627,8 +632,9 @@ def test_engine_scan(graph: DependencyGraph) -> None:
           str(sorted(p.target_enabled)))
     check("启用向全域启用压禁空", p.proposed_disabled == frozenset())
     a = e5.report(Answer.PRESENT, frozenset())
-    check("启用向末段锁段直达验证", a is Action.NEXT_PLAN
-          and e5.phase is Phase.VERIFY
+    # v0.7: 末段锁段收敛 → CONVERGED 待三选一(不再直达 VERIFY)
+    check("启用向末段锁段直达收敛", a is Action.NEXT_PLAN
+          and e5.phase is Phase.CONVERGED
           and e5.suspects == frozenset({"z.jar"}))
 
 
@@ -668,7 +674,11 @@ def test_engine_obstruct(graph: DependencyGraph) -> None:
     actual3 = frozenset(graph.closure(set(p3.proposed_disabled),
                                       set(graph.universe)))
     a = e.report(Answer.PRESENT, actual3)
-    check("A 二分收敛进验证", a is Action.NEXT_PLAN
+    # v0.7: 二分收敛 → CONVERGED, choose(VERIFY) 进隔离验证
+    check("A 二分收敛进CONVERGED", a is Action.NEXT_PLAN
+          and e.phase is Phase.CONVERGED)
+    a = e.choose(Choice.VERIFY)
+    check("A 选验证进VERIFY", a is Action.NEXT_PLAN
           and e.phase is Phase.VERIFY)
     p4 = e.current_plan
     sus = set(e.suspects)
@@ -685,7 +695,9 @@ def test_engine_obstruct(graph: DependencyGraph) -> None:
     p1 = e.current_plan
     e.report(Answer.PRESENT,
              frozenset(graph.universe - set(p1.target_enabled)))
-    check("B 二分一轮进验证", e.phase is Phase.VERIFY)
+    # v0.7: 一轮后停在 CONVERGED, choose(VERIFY) 进验证
+    check("B 二分一轮进CONVERGED", e.phase is Phase.CONVERGED)
+    e.choose(Choice.VERIFY)
     pv = e.current_plan
     a = e.report(Answer.UNTESTED,
                  frozenset(graph.universe - set(pv.target_enabled)))
@@ -832,8 +844,92 @@ def test_engine_obstruct_degenerate(cfg: AppConfig) -> None:
           and "单点试探" in p.prompt)
     a = e.report(Answer.UNTESTABLE, frozenset(g.closure(
         set(p.proposed_disabled), set(g.universe))))
-    check("2 冻结a直达验证", a is Action.NEXT_PLAN
-          and e.phase is Phase.VERIFY and e.suspects == frozenset({"b.jar"}))
+    # v0.7: 冻结 a 后嫌疑单段 → CONVERGED(不再直达 VERIFY)
+    check("2 冻结a直达收敛", a is Action.NEXT_PLAN
+          and e.phase is Phase.CONVERGED
+          and e.suspects == frozenset({"b.jar"}))
+
+
+
+# ---------------------------------------------------------------- v0.7 复测三出口
+
+def test_engine_recheck(graph: DependencyGraph, W: set) -> None:
+    print("[engine: v0.7 复测三出口]")
+    # 出口一: PRESENT(复现), 排除史空 → 单一嫌疑定罪(干净实例)
+    e = BisectEngine(graph)
+    e.report(Answer.PRESENT, frozenset())               # 基准复现
+    p = e.current_plan                                 # 二分轮(禁后半)
+    e.report(Answer.PRESENT, frozenset(W - set(p.target_enabled)))
+    check("复测前置: 停CONVERGED", e.phase is Phase.CONVERGED
+          and set(e.suspects) == {"w.jar"})
+    check("选复测进RECHECK", e.choose(Choice.RECHECK) is Action.NEXT_PLAN
+          and e.phase is Phase.RECHECK)
+    check("收敛前相位存档", e._converged_from is Phase.BISECT)
+    check("导出集合=support(嫌疑)", set(recheck_export_names(e))
+          == set(graph.support(e.suspects)))
+    check("复测复现→DONE", e.report(Answer.PRESENT, frozenset())
+          is Action.DONE and e.phase is Phase.DONE)
+    check("复测单一确诊", e.verdict is not None
+          and "干净实例复现" in e.verdict.title
+          and set(e.verdict.culprit) == {"w.jar"})
+    check("复测轮入史", e.history[-1].kind == "recheck")
+
+    # 出口二: ABSENT(不复现), 排除后重归算域尽 → 冻结+防御结案
+    e2 = BisectEngine(graph)
+    e2.report(Answer.PRESENT, frozenset())
+    p = e2.current_plan
+    e2.report(Answer.PRESENT, frozenset(W - set(p.target_enabled)))
+    e2.choose(Choice.RECHECK)
+    check("复测排除史初始空", e2.excluded == frozenset())
+    check("复测域尽→DONE", e2.report(Answer.ABSENT, frozenset())
+          is Action.DONE and e2.phase is Phase.DONE)
+    check("防御结案文案", e2.verdict is not None
+          and "未复现" in e2.verdict.title
+          and set(e2.verdict.culprit) == {"w.jar"})
+    check("域尽嫌疑冻结+入排除史", e2.frozen == frozenset({"w.jar"})
+          and e2.excluded == frozenset({"w.jar"}))
+    # 解冻撤销结案(probe 实测): verdict 撤销, 嫌疑复活回三选一
+    # — 复测排除可撤销重测(引擎 806 行注释承诺)
+    e2.unfreeze(frozenset({"w.jar"}))
+    check("解冻撤销结案回三选一", e2.verdict is None
+          and e2.phase is Phase.CONVERGED
+          and set(e2.suspects) == {"w.jar"})
+
+    # 出口三: PRESENT(复现), 排除史非空 → 共谋结案(排除∪嫌疑)
+    # 白盒预置 _excluded: 黑盒证据完备下复测排除后重归算域必空,
+    # 续查出口服务会话恢复/证据手术场景 — 共谋分支由此直测
+    e3 = BisectEngine(graph)
+    e3.report(Answer.PRESENT, frozenset())
+    p = e3.current_plan
+    e3.report(Answer.PRESENT, frozenset(W - set(p.target_enabled)))
+    e3.choose(Choice.RECHECK)
+    e3._excluded = frozenset({"z.jar"})
+    check("复测包带共谋候选", set(recheck_export_names(e3))
+          == set(graph.support(e3.suspects | e3.excluded)))
+    check("共谋复现→DONE", e3.report(Answer.PRESENT, frozenset())
+          is Action.DONE and e3.phase is Phase.DONE)
+    check("共谋结案 culprit=排除∪嫌疑", e3.verdict is not None
+          and "冲突" in e3.verdict.title
+          and set(e3.verdict.culprit) == {"w.jar", "z.jar"})
+
+
+def test_engine_reattribute(graph: DependencyGraph, W: set) -> None:
+    print("[engine: v0.7 复测续查重归算原语]")
+    # 全量重放: present → 域−hit, absent → 域∩hit, 剔 frozen/excluded
+    e = BisectEngine(graph)
+    e.report(Answer.PRESENT, frozenset())               # 基准(hit=空)
+    p = e.current_plan                                  # 二分禁后半
+    e.report(Answer.PRESENT, frozenset(W - set(p.target_enabled)))
+    dom = e._reattribute()
+    jars = {j for i in dom for j in e.graph.units[i]}
+    check("重归算=历史收缩域", jars == {"w.jar"}, str(jars))
+    # 排除史剔除: 复测排除的单元不再作嫌疑
+    e._excluded = frozenset({"w.jar"})
+    check("排除史剔域", e._reattribute() == frozenset())
+    e._excluded = frozenset()
+    # 冻结剔除: 恒启用单元同样出域
+    e._frozen = frozenset({"w.jar"})
+    check("冻结剔域", e._reattribute() == frozenset())
 
 
 def test_engine_manual_freeze(graph: DependencyGraph,
@@ -865,8 +961,9 @@ def test_engine_manual_freeze(graph: DependencyGraph,
     actual = frozenset(graph.closure(set(p.proposed_disabled),
                                      set(graph.universe)))
     a = e.report(Answer.PRESENT, actual)
-    check("B 二分续走进验证", a is Action.NEXT_PLAN
-          and e.phase is Phase.VERIFY)
+    # v0.7: 二分续走收敛 → CONVERGED(不再直达 VERIFY)
+    check("B 二分续走进收敛", a is Action.NEXT_PLAN
+          and e.phase is Phase.CONVERGED)
 
     # --- C: 冻结排空结案 + DONE 门禁 + 解冻撤销结案 ---
     f2 = e.freeze(frozenset({"w.jar"}))  # 验证轮冻掉唯一嫌疑 → 排空
@@ -876,7 +973,8 @@ def test_engine_manual_freeze(graph: DependencyGraph,
     check("C DONE禁冻结", e.freeze(frozenset({"z.jar"})) == frozenset())
     u = e.unfreeze(frozenset({"w.jar", "z.jar"}))  # z 未冻剔除, w 恢复
     check("C 解冻混合集只退w", u == frozenset({"w.jar"}))
-    check("C 结案撤销复活", e.verdict is None and e.phase is Phase.VERIFY
+    # v0.7: 撤销排空结案后单嫌疑恢复 → CONVERGED(_converged_from=VERIFY)
+    check("C 结案撤销复活", e.verdict is None and e.phase is Phase.CONVERGED
           and set(e.suspects) == {"w.jar"})
     check("C 解冻事件入史", e.history[-1].kind == "unfreeze"
           and set(e.history[-1].jars) == {"w.jar"})
@@ -1089,6 +1187,8 @@ def main() -> int:
         test_engine_branches(graph, W)
         test_engine_scan(graph)
         test_engine_obstruct(graph)
+        test_engine_recheck(graph, W)
+        test_engine_reattribute(graph, W)
         test_engine_obstruct_degenerate(cfg)
         test_engine_manual_freeze(graph, tmp, cfg)
         test_engine_pins(graph, tmp, cfg)

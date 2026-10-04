@@ -19,10 +19,10 @@ from datetime import datetime
 
 from .config import SESSIONS_DIR, AppConfig
 from .depgraph import DependencyGraph
-from .engine import Answer, BisectEngine, ScanSpec
+from .engine import Answer, BisectEngine, Choice, ScanSpec
 from .scanner import ScanResult, scan_mods_dir
 
-SESSION_VERSION = 4  # v0.6: history 加 pin_on/pin_off/pin_clear(手动钉扎显式事件); v1-v3 旧会话仍可恢复
+SESSION_VERSION = 5  # v0.7: history 加 choice_*/recheck(收敛三选一+复测答案事件); v1-v4 旧会话仍可恢复
 
 
 @dataclass
@@ -105,7 +105,7 @@ def list_sessions() -> list[dict]:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if data.get("version") not in (1, 3, SESSION_VERSION):
+            if data.get("version") not in (1, 3, 4, SESSION_VERSION):
                 # v3(钉扎前)会话仍可列出; v2 同旧行为不列出
                 continue  # 未来版本的会话: 跳过而不是硬解析
             out.append({
@@ -128,7 +128,7 @@ def restore_session(path: str, cfg: AppConfig) -> RestoreResult:
             data = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
         return RestoreResult(ok=False, reason=f"会话文件不可读: {e}")
-    if data.get("version") not in (1, 2, 3, SESSION_VERSION):
+    if data.get("version") not in (1, 2, 3, 4, SESSION_VERSION):
         return RestoreResult(ok=False, reason="会话版本不兼容")
 
     # 重扫当前目录(当前启停态可以与会话不同: 中断时正处于二分中间态)
@@ -183,6 +183,17 @@ def restore_session(path: str, cfg: AppConfig) -> RestoreResult:
             continue
         if kind == "pin_clear":
             engine.pin_clear(frozenset(rec.get("jars", [])))
+            continue
+        # v0.7: 收敛三选一事件(kind=choice_stop/choice_verify/choice_recheck)
+        # 重放: 直接调 choose 公共体(确定性状态转移, STOP 会重建 verdict+DONE)
+        if kind.startswith("choice_"):
+            engine.choose(Choice(kind[len("choice_"):]))
+            continue
+        # v0.7: 复测答案重放(kind=recheck, answer=present/absent):
+        # report 按当前 RECHECK 相位自动分发 _report_recheck(含内部冻结, 历史自对齐)
+        if kind == "recheck":
+            engine.report(Answer(rec.get("answer", "")),
+                          frozenset(), crashed=False)
             continue
         crashed = bool(rec.get("crashed")) or rec.get("answer") == "invalid"
         # 崩溃轮的 answer 字段值无意义("invalid" 非 Answer 成员), 填什么都被 crashed 分支忽略

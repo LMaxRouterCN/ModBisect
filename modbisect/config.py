@@ -55,6 +55,13 @@ class AppConfig:
     ui_scan_mode: str = "bisect"
     # 卷帘每批卷动个数(卷帘模式生效; 上限即全部, 不设人为上限)
     ui_scan_chunk: int = 3
+    # v0.7 复测导出: 上次选择的干净实例根(预填目录框, 免重复浏览;
+    # 路径不入会话 — 会话只存排查状态, 环境路径归环境配置)
+    ui_last_recheck_dir: str = ""
+    # v0.7 复测导出: 是否附带 config(modid 前缀匹配)。默认关 —
+    # config 内世界状态/机器缓存可能本身就是问题载体, 拷过去会把
+    # "mod 有 bug" 污染成 "mod + 旧状态有 bug", UI 据此标注"不建议"
+    ui_recheck_include_config: bool = False
     # ---- 依赖图 ----
     # 这些 modid 由加载器/JDK/游戏本体提供,不参与 mods 目录内的依赖传播
     ignore_modids: list[str] = field(default_factory=lambda: [

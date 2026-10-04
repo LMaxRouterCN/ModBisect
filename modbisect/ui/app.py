@@ -31,9 +31,11 @@ from PySide6.QtWidgets import (QAbstractItemView, QFileDialog, QHBoxLayout,
 
 from ..config import AppConfig, save_config
 from ..depgraph import DependencyGraph
-from ..engine import Action, Answer, BisectEngine, Phase
+from ..engine import Action, Answer, BisectEngine, Choice, Phase
 from ..executor import ApplyReport, Executor
 from ..processmon import ProcessMonitor
+from ..recheck import (RecheckReport, export_recheck,  # v0.7: 复测导出
+                       recheck_export_names)
 from ..repair import find_candidates, patch_modid
 from ..scanner import ScanResult, scan_mods_dir
 from ..session import RestoreResult, list_sessions, restore_session, save_session
@@ -42,7 +44,8 @@ from ..snapshots import (create_snapshot, list_snapshots, load_snapshot,
 from ..sortkey import name_key, version_key
 from ..watcher import Watcher
 from .deptree import DepTreePanel
-from .dialogs import RepairDialog, SnapshotDialog, VerdictDialog
+from .dialogs import (RecheckDialog, RepairDialog, SnapshotDialog,
+                       VerdictDialog)
 from ..engine import ScanSpec  # v0.4: 卷帘规格(装配见 _build_engine)
 from PySide6.QtWidgets import QComboBox, QSpinBox  # v0.4: 模式/步长
 from .panels import DepPanel
@@ -121,6 +124,9 @@ class MainWindow(QMainWindow):
         self._watcher: Watcher | None = None
         self._apply_busy = False  # v0.3.1: 磁盘写在途旗标(轻操作不走状态机)
         self._procmon: ProcessMonitor | None = None
+        # v0.7: 复测导出成功落地的实例根(终局提示手动清理;
+        # 取消/失败/会话作废即清空, 恢复会话未导出不提示)
+        self._recheck_export_dir: str | None = None
         self._current_plan = None                   # 本轮计划(提示/判决按钮用)
         self._last_report: ApplyReport | None = None
         self._crash_flag = False                    # 本轮内是否见过崩溃文件
@@ -345,10 +351,52 @@ class MainWindow(QMainWindow):
         self._btn_judge_untestable.setMinimumHeight(52)
         self._btn_judge_untestable.clicked.connect(self._on_judge_untestable)
         side.addWidget(self._btn_judge_untestable)
+        # v0.7 收敛三选一(CONVERGED 相位): 默认隐藏, 状态机按相位放行
+        self._btn_conv_stop = QPushButton("到此为止\n(结案, 未经隔离验证)")
+        self._btn_conv_stop.setMinimumHeight(52)
+        self._btn_conv_stop.setToolTip(
+            "嫌疑已收敛到唯一单元, 直接结案 — 结论未经隔离验证")
+        self._btn_conv_stop.clicked.connect(self._on_conv_stop)
+        side.addWidget(self._btn_conv_stop)
+        self._btn_conv_verify = QPushButton("就地隔离验证\n(不推荐)")
+        self._btn_conv_verify.setMinimumHeight(52)
+        self._btn_conv_verify.setToolTip(
+            "仅启用嫌疑及其依赖, 在本实例验证 — 噪声多, 不推荐")
+        self._btn_conv_verify.clicked.connect(self._on_conv_verify)
+        side.addWidget(self._btn_conv_verify)
+        self._btn_conv_recheck = QPushButton("干净实例复测\n(推荐)")
+        self._btn_conv_recheck.setMinimumHeight(52)
+        self._btn_conv_recheck.setToolTip(
+            "把嫌疑(含共谋候选与依赖)导出到干净实例隔离复测")
+        self._btn_conv_recheck.clicked.connect(self._on_conv_recheck)
+        side.addWidget(self._btn_conv_recheck)
+        # v0.7 复测双答(RECHECK 相位) + 重导出兜底
+        self._btn_rc_present = QPushButton("问题复现了\n(嫌疑有罪)")
+        self._btn_rc_present.setMinimumHeight(52)
+        self._btn_rc_present.setToolTip(
+            "干净实例中问题复现 — 定罪结案(或共谋结案)")
+        self._btn_rc_present.clicked.connect(self._on_rc_present)
+        side.addWidget(self._btn_rc_present)
+        self._btn_rc_absent = QPushButton("问题没复现\n(嫌疑独立无害)")
+        self._btn_rc_absent.setMinimumHeight(52)
+        self._btn_rc_absent.setToolTip(
+            "干净实例中问题不复现 — 冻结嫌疑, 重归算续查")
+        self._btn_rc_absent.clicked.connect(self._on_rc_absent)
+        side.addWidget(self._btn_rc_absent)
+        self._btn_rc_reexport = QPushButton("重新导出复测包…")
+        self._btn_rc_reexport.setMinimumHeight(36)
+        self._btn_rc_reexport.setToolTip(
+            "重选实例根重新导出(取消导出/会话恢复后的兜底)")
+        self._btn_rc_reexport.clicked.connect(self._on_rc_reexport)
+        side.addWidget(self._btn_rc_reexport)
         for b in (self._btn_judge_present, self._btn_judge_absent,
                   self._btn_judge_skip, self._btn_judge_retest,
                   self._btn_judge_untested, self._btn_judge_testable,
-                  self._btn_judge_untestable):
+                  self._btn_judge_untestable,
+                  # v0.7 决策相位组(与主组互斥, _apply_state 按相位放行)
+                  self._btn_conv_stop, self._btn_conv_verify,
+                  self._btn_conv_recheck, self._btn_rc_present,
+                  self._btn_rc_absent, self._btn_rc_reexport):
             b.setVisible(False)  # 仅 JUDGING 态显示
 
         side_w = QWidget()
@@ -388,14 +436,21 @@ class MainWindow(QMainWindow):
         self._btn_unfreeze.setEnabled(manual_ok)
         # 判决组: 仅 JUDGING 可见; 跳过按钮再限基准轮(引擎侧另有二次防御)
         judging = s is UiState.JUDGING
+        # v0.7 决策相位(CONVERGED/RECHECK)换按钮组;
+        # plan 缺失时保守走常规组(与旧行为一致)
+        plan_phase = (self._current_plan.phase
+                      if self._current_plan is not None else None)
+        main_judging = (judging
+                        and plan_phase not in (Phase.CONVERGED,
+                                               Phase.RECHECK))
         for b in (self._btn_judge_present, self._btn_judge_absent,
                   self._btn_judge_skip, self._btn_judge_retest,
                   self._btn_judge_untested):
-            b.setVisible(judging)
+            b.setVisible(main_judging)
         # v0.5 可测性对: 默认隐藏, 仅 OBSTRUCT 态接管(主组退场)
         for b in (self._btn_judge_testable, self._btn_judge_untestable):
             b.setVisible(False)
-        if judging and self._current_plan is not None:
+        if main_judging and self._current_plan is not None:
             self._btn_judge_skip.setVisible(
                 self._current_plan.phase is Phase.BASELINE)
             if self._current_plan.phase is Phase.OBSTRUCT:
@@ -405,6 +460,14 @@ class MainWindow(QMainWindow):
                     b.setVisible(False)
                 self._btn_judge_testable.setVisible(True)
                 self._btn_judge_untestable.setVisible(True)
+        # v0.7 收敛三选一: 仅 CONVERGED 相位可见(主判读组退场)
+        for b in (self._btn_conv_stop, self._btn_conv_verify,
+                  self._btn_conv_recheck):
+            b.setVisible(judging and plan_phase is Phase.CONVERGED)
+        # v0.7 复测组: 双答 + 重导出, 仅 RECHECK 相位可见
+        for b in (self._btn_rc_present, self._btn_rc_absent,
+                  self._btn_rc_reexport):
+            b.setVisible(judging and plan_phase is Phase.RECHECK)
         # 开始按钮文案: 恢复的会话(引擎在场) = 继续; 全新扫描 = 开始
         if s is UiState.READY:
             self._btn_start.setText(
@@ -1058,6 +1121,136 @@ class MainWindow(QMainWindow):
         self._log("[轮] 本轮作废, 重新测试")
         self._begin_round()
 
+
+    # -------------------------------------------------- 收敛三选一(v0.7)
+
+    def _submit_choice(self, choice: Choice) -> None:
+        """CONVERGED 三选一统一入口(引擎 choose 归档后分流)。
+
+        - STOP: 结案(未经隔离验证) → _finish;
+        - VERIFY: 钉禁守卫未结案 → 正常开验证轮;
+        - RECHECK: 引擎已立 RECHECK 相位 → 弹导出对话框走后台导出。
+        引擎非 CONVERGED 时 choose 为防御空操作(不入史不推进),
+        重走 _begin_round 回收敛态, 按钮组自然复位。
+        """
+        if self._apply_busy or self._state is not UiState.JUDGING:
+            return
+        action = self._engine.choose(choice)
+        save_session(self._scan, self._engine)
+        if action is Action.DONE:
+            self._finish()  # STOP; 或 VERIFY 钉禁守卫直接结案
+            return
+        if (choice is Choice.RECHECK
+                and self._engine.phase is Phase.RECHECK):
+            self._run_recheck_export()
+            return
+        self._begin_round()  # VERIFY 开轮 / 防御空操作回收敛
+
+    def _on_conv_stop(self) -> None:
+        self._submit_choice(Choice.STOP)
+
+    def _on_conv_verify(self) -> None:
+        self._submit_choice(Choice.VERIFY)
+
+    def _on_conv_recheck(self) -> None:
+        self._submit_choice(Choice.RECHECK)
+
+    # -------------------------------------------------- 复测轮(v0.7)
+
+    def _on_rc_present(self) -> None:
+        # 复测答走 _submit_answer: 引擎按 RECHECK 相位自动分发
+        self._submit_answer(Answer.PRESENT)
+
+    def _on_rc_absent(self) -> None:
+        self._submit_answer(Answer.ABSENT)
+
+    def _on_rc_reexport(self) -> None:
+        """重导出兜底: 取消导出/会话恢复未导出时自举。"""
+        self._run_recheck_export()
+
+    def _run_recheck_export(self) -> None:
+        """复测导出流程: RecheckDialog(实例根+范围) → 后台导出。
+
+        导出期间 APPLYING 态(判读组自然退场); 取消停在复测态
+        (引擎已在 RECHECK, 不回 CONVERGED — 重导出按钮兜底)。
+        """
+        if (self._apply_busy or self._engine is None
+                or self._engine.phase is not Phase.RECHECK):
+            return  # 防御: 导出仅 RECHECK 相位合法
+        names = recheck_export_names(self._engine)
+        if not names:
+            self._log("[复测] 导出集合为空(引擎状态异常, 请重新扫描)")
+            return
+        dlg = RecheckDialog(
+            names, self._cfg.ui_recheck_include_config,
+            self._cfg.ui_last_recheck_dir, self)
+        if not dlg.exec():
+            self._log("[复测] 已取消导出 — 随时可用「重新导出复测包」")
+            self._enter_recheck()
+            return
+        # 偏好即时持久化(路径/范围属环境, 归 AppConfig 不入会话)
+        self._cfg.ui_last_recheck_dir = dlg.instance_root
+        self._cfg.ui_recheck_include_config = dlg.include_config
+        save_config(self._cfg)
+        # 导出目标实例根(成功落地后终局提示手动清理, 不自动删)
+        self._recheck_export_dir = dlg.instance_root
+        self._set_state(UiState.APPLYING, "正在导出复测包到干净实例…")
+        self._spawn(export_recheck, self._scan, self._engine,
+                    dlg.instance_root, dlg.include_config, self._cfg,
+                    on_done=self._on_recheck_done,
+                    on_fail=self._on_recheck_fail)
+
+    def _on_recheck_done(self, rep: RecheckReport) -> None:
+        """导出完成: 成功进复测双答; 失败如实报告, 重导出兜底。"""
+        if self._engine is None:
+            # 导出期间会话被中止/作废(竞态防御): 弃结果清标记
+            self._recheck_export_dir = None
+            return
+        for m in rep.missing:
+            self._log(f"[复测] 源文件缺失: {m}")
+        for e in rep.errors:
+            self._log(f"[错误] {e}")
+        if rep.ok:
+            extra = (f"(含 config {len(rep.copied_configs)} 条)"
+                     if rep.copied_configs else "")
+            self._log(f"[复测] 已导出 {len(rep.copied_mods)} 个 mod → "
+                      f"{self._recheck_export_dir}{extra}")
+            self._log("[复测] 请在干净实例启动游戏测试, 测完回来作答")
+            self._enter_recheck()
+            return
+        # 失败/不完整: 清标记(终局不提示清理半成品), 停复测态可重试
+        self._recheck_export_dir = None
+        self._log("[复测] 导出未完成 — 可「重新导出复测包」重试")
+        self._enter_recheck()
+
+    def _on_recheck_fail(self, err: str) -> None:
+        """导出后台任务异常(线程级): 清标记, 停复测态可重试。"""
+        self._recheck_export_dir = None
+        if self._engine is None:
+            return
+        self._log(f"[错误] 复测导出异常: {err}")
+        self._enter_recheck()
+
+    def _enter_converged(self) -> None:
+        """v0.7 收敛待决: JUDGING 态, 三选一按钮组接管(_apply_state)。"""
+        self._refresh_indicators()
+        self._refresh_table()
+        self._set_state(UiState.JUDGING, "嫌疑已收敛 — 请选择处置方式")
+
+    def _enter_recheck(self) -> None:
+        """v0.7 复测轮: JUDGING 态, 双答/重导出组接管。
+
+        干净实例在程序管辖之外: 不 apply 不 procmon 不 WAIT_GAME;
+        会话恢复直入时无导出史, 重导出按钮即自举入口。
+        """
+        # v0.7 修正: 刷新轮计划 — conv_recheck/取消/导出失败路径不经
+        # _begin_round, 旧计划相位过时会把按钮路由锁死在收敛三选一组
+        # (双答组永不亮)。current_plan 纯推导, 重取幂等零扰动。
+        self._current_plan = self._engine.current_plan
+        self._refresh_indicators()
+        self._refresh_table()
+        self._set_state(UiState.JUDGING, "复测轮 — 干净实例测试后作答")
+
     def _submit_answer(self, answer) -> None:
         if self._apply_busy:  # v0.5.2: 冻结复原在途, 禁作答(归算基准未定)
             return
@@ -1066,8 +1259,11 @@ class MainWindow(QMainWindow):
         # 用户在崩溃警告下仍作答 = 用户自主确认本轮信号有效
         frozen_before = self._engine.frozen  # v0.5: 冻结增量观测(日志)
         pins_before = self._engine.pinned  # v0.6: 冻结吞钉增量观测(日志)
-        action = self._engine.report(
-            answer, self._last_report.actual_disabled, crashed=False)
+        # v0.7: 复测轮可无 apply 历史(会话恢复直入 RECHECK),
+        # 而 _report_recheck 不读 actual_disabled — 缺席传空集防 None 崩
+        actual = (self._last_report.actual_disabled
+                  if self._last_report is not None else frozenset())
+        action = self._engine.report(answer, actual, crashed=False)
         if self._engine.frozen != frozen_before:
             # 阻碍子流程刚冻结 mod: 恒启用钉死, 移出嫌疑与调度
             self._log("[冻结] " + ", ".join(sorted(
@@ -1162,6 +1358,12 @@ class MainWindow(QMainWindow):
                 self._set_state(self._state, "嫌疑已冻空结案 — 游戏退出后出示报告")
             else:
                 self._finish()
+            return
+        if self._engine.phase in (Phase.CONVERGED, Phase.RECHECK):
+            # v0.7 决策相位纯记账: 哨兵计划 target 是空集, 走 JUDGING
+            # 复原分支会把 frozenset()|frozen 当 apply 目标 = 全目录
+            # 清盘(灾难)。冻结恒启用语义由下轮正常计划自然吸收。
+            self._set_state(self._state, "冻结已记录(决策相位纯记账, 下轮吸收)")
             return
         if self._state is UiState.WAIT_LAUNCH:
             # 冻结/解冻都改变嫌疑池: 旧计划作废, 重开轮重取计划
@@ -1370,6 +1572,16 @@ class MainWindow(QMainWindow):
         plan = self._engine.current_plan
         self._current_plan = plan
         self._crash_flag = False
+        # v0.7 空集哨兵拦截: 决策相位无磁盘操作 — 不 apply 不 procmon
+        # (CONVERGED 交互态 / RECHECK 测试在实例根外), 直接进对应判读组
+        if plan.phase is Phase.CONVERGED:
+            self._log(f"[轮 {plan.index}] {plan.prompt}")
+            self._enter_converged()
+            return
+        if plan.phase is Phase.RECHECK:
+            self._log(f"[轮 {plan.index}] {plan.prompt}")
+            self._enter_recheck()
+            return
         self._refresh_indicators()
         self._refresh_table()
         self._log(f"[轮 {plan.index}] {plan.prompt}")
@@ -1457,6 +1669,17 @@ class MainWindow(QMainWindow):
         self._refresh_table()   # 嫌疑标记已收敛到罪魁
         self._watcher_teardown()
         self._log(f"[终局] {self._engine.verdict.title}")
+        if self._recheck_export_dir is not None:
+            # v0.7: 复测包已落到干净实例 — 程序不代删(用户游戏目录,
+            # 自动删除不可回退); 终局弹窗 + 日志双通道提示手动清理
+            self._log(f"[复测] 复测包仍留在干净实例: "
+                      f"{self._recheck_export_dir} — 测完可手动删除")
+            QMessageBox.information(
+                self, "复测包清理提醒",
+                "此前导出的复测包仍留在干净实例:\n"
+                + self._recheck_export_dir
+                + "\n\n排查结束后可手动删除其中的 mods(及 config)条目。")
+            self._recheck_export_dir = None  # 提示一次性, 不重复弹出
         dlg = VerdictDialog(self._engine.verdict, self)
         dlg.exec()
         if dlg.restore_requested:
@@ -1501,6 +1724,9 @@ class MainWindow(QMainWindow):
             self._procmon.stop()  # 游戏若在跑, 线程在其退出后自行了结
         self._engine = None
         self._pending_finish = False  # v0.5.2: 会话作废, 挂起结案作废
+        # v0.7: 复测标记随会话作废清空(若导出已完成会提示手动清理,
+        # 见 _finish; 中止则视为放弃跟踪 — 不弹终局弹窗故不提示)
+        self._recheck_export_dir = None
         if clicked is b_restore:
             self._set_state(UiState.APPLYING, "正在还原所有 mod…")
             self._spawn(self._executor.restore_initial,

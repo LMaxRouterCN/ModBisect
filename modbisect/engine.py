@@ -60,6 +60,8 @@ class Phase(str, Enum):
     OBSTRUCT = "obstruct"  # 可测性子二分(v0.5: 定位阻碍 mod, 冻结后回主流程)
     BISECT = "bisect"      # 二分进行中
     VERIFY = "verify"      # 验证轮(最小复现集隔离验证)
+    CONVERGED = "converged"  # 收敛待决(v0.7: 等用户三选一)
+    RECHECK = "recheck"      # 复测轮(v0.7: choose 消费结果)
     DONE = "done"          # 终局(读 verdict)
 
 
@@ -68,6 +70,12 @@ class Action(str, Enum):
     NEXT_PLAN = "next_plan"      # 状态已推进,取下一轮计划
     RETEST_SAME = "retest_same"  # 本轮作废(崩溃/重测),同计划重走流程
     DONE = "done"                # 会话终局
+class Choice(str, Enum):
+    """v0.7 收敛三选一(CONVERGED 相位, choose() 消费)。"""
+    STOP = "stop"        # 结束排查(直接结案, 未经隔离验证)
+    VERIFY = "verify"    # 就在本实例验证(非常不建议)
+    RECHECK = "recheck"  # 干净实例复测(推荐, 需要配置路径)
+
 
 
 @dataclass(frozen=True)
@@ -79,6 +87,7 @@ class RoundPlan:
     target_enabled: frozenset[str]     # 目标启用 jar 集(W 域内)
     proposed_disabled: frozenset[str]  # 提议禁用集(闭包扩大前,复盘用)
     suspects: frozenset[str]           # 本轮嫌疑 jar 集(展示用)
+    rescued: frozenset[str] = frozenset()  # v0.7: 验证轮救回强制启用的支撑 jar
 
 
 @dataclass
@@ -92,6 +101,10 @@ class RoundRecord:
       此时 plan=None, jars = 本次操作的 jar 集(整单元成员)。
     - "pin_on"/"pin_off"/"pin_clear"(v0.6): 手动钉扎显式事件, 重放
       据此直接调用 pin_toggle/pin_clear; jars 同为整单元成员。
+    - "choice_stop"/"choice_verify"/"choice_recheck"(v0.7): 收敛三
+      选一显式事件, 重放据此直接调用 choose; jars = 嫌疑单元。
+    - "recheck"(v0.7): 干净实例复测答案(present/absent), 重放经
+      report 按 RECHECK 相位分发; jars = 本次嫌疑单元。
     """
     plan: RoundPlan | None
     answer: str                        # 玩家回答("invalid" = 崩溃作废轮)
@@ -168,6 +181,11 @@ class BisectEngine:
         # 钉启 = 恒启用(不动调度, 依赖缺失由阻碍子流程自然收敛)
         self._pin_off: frozenset[str] = frozenset()
         self._pin_on: frozenset[str] = frozenset()
+        # v0.7 收敛与复测记账: 复测排除史 + 收敛前相位存档
+        # (_excluded = 历次复测 absent 被冻结的嫌疑, 共谋 culprit 素材;
+        #  _converged_from = 收敛时相位, 复测续查重归算后恢复 SCAN/BISECT)
+        self._excluded: frozenset[str] = frozenset()
+        self._converged_from: Phase = Phase.BASELINE
 
     # -------------------------------------------------- 展示辅助(只读)
 
@@ -208,6 +226,11 @@ class BisectEngine:
         """钉启集(强制启用侧, base 名)。"""
         return self._pin_on
 
+    @property
+    def excluded(self) -> frozenset[str]:
+        """v0.7: 复测排除史(历次干净复测 absent 被冻结的嫌疑)。"""
+        return self._excluded
+
     # -------------------------------------------------- 计划推导(只读)
 
     @property
@@ -225,16 +248,37 @@ class BisectEngine:
             )
         if self.phase is Phase.VERIFY:
             unit_jars = self._single_suspect_unit()
-            target = self.graph.support(unit_jars) | self._frozen  # 嫌疑+支撑依赖链+冻结恒钉启用
-            # v0.6: 钉扎 overlay(嫌疑自身被钉禁的场景已被入口守卫截断,
-            # 此处只处理非嫌疑钉扎的常规改写)
-            target = self._pin_overlay(target)
+            # v0.7: 统一出口原语(_pe2 抽出, 五相位计划共用) — 嫌疑
+            # = 必启核, 支撑链抬升; 钉禁对核让位救回(rescued 记账),
+            # 否则支撑被钉禁拖死, 验证轮崩溃死循环(v0.6 盲区).
+            target, rescued = self._outlet(unit_jars)
             return RoundPlan(
                 index=self._round_index + 1,
                 phase=Phase.VERIFY,
                 prompt="验证轮: 仅启用嫌疑 mod 及其必需依赖,确认 bug 是否复现",
                 target_enabled=target,
                 proposed_disabled=self.universe - target,
+                suspects=self.suspects,
+                rescued=rescued,
+            )
+        if self.phase is Phase.CONVERGED:
+            # v0.7 收敛待决: 空集哨兵(UI 跳过 apply, 展示三选一)
+            return RoundPlan(
+                index=self._round_index,
+                phase=Phase.CONVERGED,
+                prompt="已收敛: 请选择处置(结案/隔离验证/复测)",
+                target_enabled=frozenset(),
+                proposed_disabled=frozenset(),
+                suspects=self.suspects,
+            )
+        if self.phase is Phase.RECHECK:
+            # v0.7 复测轮: 手动调整环境后测, 引擎不 diff(空集哨兵)
+            return RoundPlan(
+                index=self._round_index,
+                phase=Phase.RECHECK,
+                prompt="复测轮: 手动调整 mod 后测试问题是否复现",
+                target_enabled=frozenset(),
+                proposed_disabled=frozenset(),
                 suspects=self.suspects,
             )
         if self.phase is Phase.SCAN:
@@ -247,11 +291,12 @@ class BisectEngine:
                 # 启用方向: 静默底场(仅已卷段+帘带支撑闭包启用),
                 # 判据=问题出现; support 拖入的依赖"提前上场",
                 # 记账按执行层实际启用集归算(与闭包拖拽同构)
-                # v0.6: 钉扎 overlay(未卷段的钉启者提前上场; 钉禁闭包剔除)
-                target = self._pin_overlay(
+                # v0.7: 统一出口 — need = 必启核(已卷段+帘带+冻结),
+                # support 由原语抬升(含冻结依赖, v0.6 字面并入盲区修正;
+                # 锁序保证已卷段抬升为空操作); 钉禁对核让位救回(resc).
+                target, resc = self._outlet(
                     frozenset(spec.order[:self._scan_pos])
-                    | self.graph.support(band_set)
-                    | self._frozen)
+                    | band_set | self._frozen)
                 eff = self.universe - target
                 prompt = (f"卷帘轮: 启用下一段 {len(band)} 个"
                           f"(其余 {len(eff)} 个全禁), 测试问题是否出现")
@@ -259,8 +304,11 @@ class BisectEngine:
                 # 禁用方向: 全启用前提(同基准轮), 逐段禁用(含闭包拖拽)
                 rolled = ((frozenset(spec.order[:self._scan_pos]) - self._frozen) | band_set)
                 eff = self.graph.closure(rolled, set(self.universe))
-                # v0.6: 钉扎 overlay(钉禁闭包恒在场, 钉启恒启用)
-                target = self._pin_overlay((self.universe - eff) | self._frozen)
+                # v0.7: 统一出口(禁用向) — need = 存活核预剔钉禁闭包
+                # (恒禁语义由预剔保持; eff 为闭包 ⟹ 存活核支撑封闭 ⟹
+                # 抬升为空操作); 钉启/冻结(含支撑)整体恒启用, resc 恒空.
+                target, resc = self._outlet(
+                    (self.universe - eff) - self._pin_dead())
                 prompt = (f"卷帘轮: 禁用下一段 {len(band)} 个, "
                           "测试问题是否消失")
             return RoundPlan(
@@ -270,6 +318,7 @@ class BisectEngine:
                 target_enabled=target,
                 proposed_disabled=frozenset(eff),
                 suspects=self.suspects,
+                rescued=resc,  # v0.7: 启向核支撑链被钉禁让位救回的成员
             )
         if self.phase is Phase.OBSTRUCT:
             # 可测性轮(v0.5): 最近可测态 + 试探禁用候选(闭包扩张)。
@@ -294,9 +343,10 @@ class BisectEngine:
             def _forecast(pu: frozenset[int]) -> frozenset[int]:
                 """试探单元集 → 预报命中池的单元集(与 UNTESTABLE 归算同构)。
 
-                v0.6: 命中 = 探针闭包 ∪ 钉禁闭包(overlay 恒在场)再减
-                冻结/钉启(恒启用侧永不入命中) — 与计划出口 overlay 同构;
-                预报偏小会使探针合法性判断失真(命中必须含钉禁拖拽)。
+                v0.7: 镜像统一出口 — actual = pin_dead ∪ (eff−always),
+                等价变形 hit = (eff2 ∪ pin_dead) − always; always 含
+                恒启用侧支撑抬升(救回的依赖不属实际禁用), 与执行层
+                回读严格同构; 预报偏小会使探针合法性判断失真。
                 """
                 jars: set[str] = set()
                 for i in pu:
@@ -304,7 +354,7 @@ class BisectEngine:
                 eff2 = self.graph.closure(ob.base_actual | jars,
                                           set(self.universe))
                 hit = ((frozenset(eff2) | self._pin_dead())
-                       - self._frozen - self._pin_on)
+                       - self._always_on())
                 return frozenset(
                     self.graph.unit_of[j] for j in hit
                     if j in self.graph.unit_of) & ob.pool
@@ -332,8 +382,10 @@ class BisectEngine:
             # 子轮目标 = 上一可测配置 + 试探侧(闭包扩张); 冻结恒钉启用
             eff = self.graph.closure(ob.base_actual | probe_jars,
                                      set(self.universe))
-            # v0.6: 钉扎 overlay(与 _forecast 同构, 否则预报与实际脱钩)
-            target = self._pin_overlay((self.universe - eff) | self._frozen)
+            # v0.7: 统一出口(禁用向, 与 _forecast 镜像同构; 守卫保证
+            # pin_dead ⊆ base_actual ⊆ eff, 故 need 预剔为空操作)
+            target, _resc = self._outlet(
+                (self.universe - eff) - self._pin_dead())
             prompt = (f"可测性轮: 额外禁用 {len(probe_jars)} 个阻碍候选"
                       f"(池剩 {len(ob.pool)} 组), 游戏能否正常启动并观察?")
             if degraded:
@@ -358,14 +410,16 @@ class BisectEngine:
         # 计划侧闭包预估(D7: 归算以执行层回报的实际集为准,不信此预估)
         eff = self.graph.closure(disabled, set(self.universe))
         n_dis = len(disabled)
+        # v0.5: 冻结恒钉启用(闭包拖拽也拖不死)
+        # v0.7: 统一出口(禁用向) — need 预剔钉禁闭包(恒禁), always
+        # 支撑抬升(冻结依赖一并救活, v0.6 假启用盲区修正); resc 恒空.
+        need = (self.universe - eff) - self._pin_dead()
+        target, _resc = self._outlet(need)
         return RoundPlan(
             index=self._round_index + 1,
             phase=Phase.BISECT,
             prompt=f"二分轮: 禁用约一半嫌疑 mod({n_dis} 个),启动游戏测试",
-            # v0.5: 冻结恒钉启用(闭包拖拽也拖不死)
-            # v0.6: 钉扎 overlay(钉禁闭包禁/钉启恒启)统一改写计划出口
-            target_enabled=self._pin_overlay(
-                (self.universe - eff) | self._frozen),
+            target_enabled=target,
             proposed_disabled=frozenset(disabled),
             suspects=self.suspects,
         )
@@ -392,7 +446,7 @@ class BisectEngine:
         仅恢复解冻时原属嫌疑池的单元(_frozen_was_suspect 记账);
         会话若因「冻结排空」结案(_frozen_drained), 解冻使嫌疑池复活时
         撤销结案, 恢复到冻结前相位继续推理(单单元经
-        _enter_next_phase_or_verify 自动转 VERIFY)。
+        _enter_next_phase_or_converged 自动转 VERIFY)。
         """
         return self._manual_freeze(bases, "unfreeze")
 
@@ -464,10 +518,11 @@ class BisectEngine:
                 # 单元数重判: 单单元转 VERIFY(v0.6: 钉禁守卫可截断结案);
                 # 多单元滞留 VERIFY 退回二分
                 if len(self._suspect_units) == 1:
-                    self.phase = Phase.VERIFY
-                    self._verify_entry_guard()  # True 时已改判 DONE
+                    # v0.7: 单嫌疑恢复 → 收敛三选一(不再直进 VERIFY)
+                    self._converged_from = self.phase
+                    self.phase = Phase.CONVERGED
                 elif (len(self._suspect_units) > 1
-                      and self.phase is Phase.VERIFY):
+                      and self.phase in (Phase.VERIFY, Phase.CONVERGED)):
                     self.phase = Phase.BISECT
             touched = set(gone)
         # 轮次号不推进: 手动冻结/解冻不是测试轮, 不吃 plan.index 计数
@@ -487,17 +542,22 @@ class BisectEngine:
         同单元方向翻转 = 替换(先摘旧方向, 同时只钉一个方向)。
         与冻结的分工: freeze = 钉启 + 移出嫌疑与调度(用户担保无罪);
         钉禁 = 留在嫌疑池参与归因(用户怀疑它, 问题消失轮自然命中)。
-        钉启不抬升支撑依赖: 依赖被引擎禁 → 缺依赖 → UNTESTED → 阻碍
-        子流程自然收敛(与 frozen 同构的载重行为); 若抬升依赖会中和
-        OBSTRUCT 探针预报 → 池零收缩死循环(v0.5.1 活锁复辟)。
-        门禁: OBSTRUCT(池不变量)/VERIFY(隔离纯度)/DONE(终局)拒绝。
+        v0.7 抬升修正: 恒启用侧(_always_on)含支撑闭包 — 钉启/冻结
+        的依赖一并恒启, 修正 v0.6 "字面并入不抬升"的假启用盲区
+        (依赖被引擎禁 → 字面钉启实际跑不起来 → 未申报禁用污染
+        D7 归算); 抬升与探针预报同源(_forecast 同用 always), 活锁
+        论证不变(单点全拖 ⟹ SCC 与单元划分矛盾), 无 v0.5.1 复辟.
+        门禁: OBSTRUCT(池不变量)/VERIFY(隔离纯度)/DONE(终局)拒绝;
+        v0.7 增 CONVERGED/RECHECK(决策相位, 归因纯度)拒绝 — 收敛与
+        复测的推理上下文不容调度层翻转, 修正钉扎走 pin_clear 撤销.
         冲突守卫: 钉禁闭包不得触碰钉启或冻结(拖死恒启用成员 = 矛盾);
         钉启者的支撑闭包不得含其余钉禁(缺依赖跑不起来)。违规整批拒绝。
         返回实际钉住的 jar 集(整单元成员); 空 = 无事发生
         (不在 W / 门禁 / 冲突 / 幂等重钉)。
         """
-        # 门禁: 三相位拒绝(引擎侧强制, UI 侧另有提示双保险)
-        if self.phase in (Phase.OBSTRUCT, Phase.VERIFY, Phase.DONE):
+        # 门禁: 五相位拒绝(引擎侧强制, UI 侧另有提示双保险)
+        if self.phase in (Phase.OBSTRUCT, Phase.VERIFY, Phase.DONE,
+                          Phase.CONVERGED, Phase.RECHECK):
             return frozenset()
         # 输入过滤: 只认 W 域内成员, 提升到绑定单元(整单元钉扎)
         want: set[str] = set()
@@ -507,16 +567,27 @@ class BisectEngine:
         if not want:
             return frozenset()
         if enable:
-            # 冲突守卫: 钉启者的支撑闭包含其余钉禁 → 字面矛盾
-            if self.graph.support(want) & (self._pin_off - want):
+            # v0.7 P10 冻结成员守卫: 冻结已恒钉启用且移出调度, 再钉启
+            # 是语义噪声(冻结吞钉路径会再摘除) → 整批拒绝
+            if want & self._frozen:
+                return frozenset()
+            # v0.7 P10 支撑级守卫: 抬升语义下钉启者的支撑链被钉禁
+            # 闭包拖死 = 必启与恒禁直接矛盾(v0.6 字面检查漏掉"被
+            # 拖死的依赖者"); want 自身旧钉禁将被替换摘除, 故排除.
+            if self.graph.support(want) & (self._pin_dead()
+                                           - frozenset(want)):
                 return frozenset()
             new_on = self._pin_on | frozenset(want)
             new_off = self._pin_off - frozenset(want)  # 替换: 摘旧钉禁
         else:
-            # 冲突守卫: 钉禁闭包(含既有)触碰钉启(幸存者)或冻结 → 矛盾
+            # v0.7 P10 支撑级守卫: 冲突域扩到恒启用侧整体(含支撑
+            # 抬升) — 拖死"钉启/冻结成员的依赖" = 抬升语义下的
+            # 必启与恒禁交(v0.6 只挡成员本身的字面死亡); 拒绝并
+            # 交用户裁决(先撤销对侧钉扎, 或换钉禁目标).
             dead = self.graph.closure(self._pin_off | want,
                                       set(self.universe))
-            if dead & ((self._pin_on - want) | self._frozen):
+            pin_side = (self._pin_on - want) | self._frozen
+            if dead & (self.graph.support(pin_side) | pin_side):
                 return frozenset()
             new_off = self._pin_off | frozenset(want)
             new_on = self._pin_on - frozenset(want)  # 替换: 摘旧钉启
@@ -534,7 +605,9 @@ class BisectEngine:
         """撤销钉扎(双向摘除, 单元粒度): 回归引擎自由调度。
 
         门禁比新钉宽: VERIFY 放行(撤销可恢复隔离纯度 — 收敛与钉禁
-        一致的结案可由此回到验证正路); OBSTRUCT(池不变量)/DONE 仍拒。
+        一致的结案可由此回到验证正路); v0.7 CONVERGED/RECHECK(决策
+        相位)亦放行 — 撤销钉扎是决策上下文的合法修正(如撤钉禁后
+        重选隔离验证); OBSTRUCT(池不变量)/DONE 仍拒。
         返回实际摘除钉扎的 jar 集; 空 = 无事发生。
         """
         if self.phase in (Phase.OBSTRUCT, Phase.DONE):
@@ -554,6 +627,44 @@ class BisectEngine:
             kind="pin_clear", jars=frozenset(hit)))
         return frozenset(hit)
 
+    # -------------------------------------------------- 收敛三选一(v0.7)
+
+    def choose(self, choice: Choice) -> Action:
+        """CONVERGED 三选一消费(显式事件入史, session v5 重放依据)。
+
+        - STOP: 结束排查(罪魁 = 唯一嫌疑, 未经隔离验证);
+        - VERIFY: 原 v0.6 验证流程(钉禁入口守卫保留: 钉禁侧验证
+          无意义, 以「收敛与钉禁一致」改判 DONE);
+        - RECHECK: 转干净实例复测相位(导出/测试由 executor+UI 层
+          完成, 引擎只管状态; 答案回 _report_recheck 归因)。
+        非 CONVERGED 相位调用 = 防御空操作(NEXT_PLAN)。
+        """
+        if self.phase is not Phase.CONVERGED:
+            return Action.NEXT_PLAN
+        unit_jars = self._single_suspect_unit()
+        # 显式事件: 自由意志入史供重放(路径/范围存 AppConfig 不入会话)
+        self.history.append(RoundRecord(
+            plan=None, answer="", actual_disabled=frozenset(),
+            kind="choice_" + choice.value, jars=frozenset(unit_jars)))
+        if choice == Choice.STOP:
+            self.verdict = Verdict(
+                title="结案: 罪魁(未经隔离验证)",
+                detail="嫌疑已收敛到唯一单元: "
+                       + ", ".join(sorted(unit_jars))
+                       + ", 按你的选择结束排查(未经隔离验证)。",
+                culprit=unit_jars)
+            self.phase = Phase.DONE
+            return Action.DONE
+        if choice == Choice.VERIFY:
+            # v0.6 钉禁守卫前移至此: stop/recheck 不再被短路剥夺
+            if self._verify_entry_guard():
+                return Action.DONE
+            self.phase = Phase.VERIFY
+            return Action.NEXT_PLAN
+        # Choice.RECHECK: 干净实例复测相位(答案走 _report_recheck)
+        self.phase = Phase.RECHECK
+        return Action.NEXT_PLAN
+
     # -------------------------------------------------- 钉扎内部工具(私有)
 
     def _pin_dead(self) -> frozenset[str]:
@@ -571,10 +682,41 @@ class BisectEngine:
         - frozen 已含于各相位 target, 此处不重复处理;
         - 冲突守卫保证闭包与钉启/冻结无交, 减法不误伤。
         无钉扎时原样返回(零开销短路)。
+        v0.7: 五相位计划出口已统一切换 _outlet, 本函数仅剩
+        BASELINE 相位调用(全启用前提的钉扎改写, 无必启核概念)。
         """
         if not (self._pin_on or self._pin_off):
             return target
         return (target | self._pin_on) - self._pin_dead()
+
+    def _always_on(self) -> frozenset[str]:
+        """v0.7 恒启用原语: support(冻结∪钉启) ∪ 冻结∪钉启.
+
+        恒启用侧连同支撑依赖链一起启用 — 修正 v0.6 "字面并入
+        不抬升"盲区: 假启用(缺依赖跑不起来)在执行层制造未申报
+        的实际禁用, 污染 D7 回读归算. 守卫不变式(support(恒启用
+        侧) ∩ pin_dead = ∅)保证本集与钉禁闭包无交, 并入不减.
+        """
+        side = self._frozen | self._pin_on
+        return self.graph.support(side) | side
+
+    def _outlet(self, need: frozenset[str]) -> tuple[frozenset[str],
+                                                      frozenset[str]]:
+        """v0.7 统一计划出口原语: need(必启核) → (final, rescued).
+
+        lifted = support(need) ∪ need(依赖抬升; 禁用向存活核因
+        eff 闭包而支撑封闭, 抬升为空操作); final = lifted ∪
+        always(恒启用整体); rescued = lifted ∩ pin_dead(钉禁对
+        必启核让位救回 — 核的支撑链落在钉禁闭包内时, 依需求
+        救回并记账, 供 UI 明示"本轮钉扎被让位").
+        调用方两形: 启用向传必启核本体; 禁用向传 (universe−eff)
+        −pin_dead(预剔钉禁闭包保恒禁语义 — need 不含, always
+        亦不含, 恒禁由预剔等效完成).
+        """
+        lifted = self.graph.support(need) | frozenset(need)
+        final = lifted | self._always_on()
+        rescued = lifted & self._pin_dead()
+        return frozenset(final), frozenset(rescued)
 
     def _pin_yield_to_frozen(self, new_jars: frozenset[str]) -> None:
         """冻结吞钉(v0.6): 摘除与冻结集冲突的全部钉禁根源。
@@ -617,6 +759,102 @@ class BisectEngine:
         self.phase = Phase.DONE
         return True
 
+    def _report_recheck(self, answer: Answer) -> Action:
+        """v0.7 复测归算(RECHECK 相位): 干净实例双答三出口。
+
+        复测集合 = 本次嫌疑 + 累计 _excluded(共谋候选, 各自连
+        依赖整体进干净实例 — 导出/测试由 executor+UI 完成,
+        引擎只归因):
+        - PRESENT(复现): _excluded 空 → 单一嫌疑独立复现 → 定罪
+          结案; 非空 → 共谋结案(culprit = 集合, 文案 max 原文)。
+        - ABSENT(不复现): 嫌疑在干净实例独立无害 → 冻结 +
+          _excluded 累积 + _reattribute 重归算续查;
+          空池 → "组合成因未复现"防御结案。
+        """
+        unit_jars = self._single_suspect_unit()
+        # 复测事件入史(kind=recheck; answer 承载 present/absent,
+        # jars = 本次嫌疑 — session v5 重放据此直接调本方法)
+        self.history.append(RoundRecord(
+            plan=None, answer=answer.value,
+            actual_disabled=frozenset(),
+            kind="recheck", jars=frozenset(unit_jars)))
+        self._round_index += 1  # 复测是一次真实玩家测试, 占轮次号
+        if answer == Answer.PRESENT:
+            if not self._excluded:
+                self.verdict = Verdict(
+                    title="确诊: 单一问题 mod(干净实例复现)",
+                    detail="嫌疑 mod 在干净实例中独立复现问题, "
+                           "确诊为罪魁(隔离验证完成): "
+                           + ", ".join(sorted(unit_jars)) + "。\n"
+                           "建议: 保持该 mod 禁用, 向作者反馈问题。",
+                    culprit=unit_jars)
+            else:
+                culprit = self._excluded | unit_jars
+                self.verdict = Verdict(
+                    title="结案: 模组冲突(共谋)",
+                    detail="多个模组共同导致的问题：{"
+                           + ", ".join(sorted(culprit)) + "}\n"
+                           "禁用其中任意一个问题消失,这属于模组之间"
+                           "的冲突和兼容问题, 建议给双方作者同时反馈.",
+                    culprit=culprit)
+            self.phase = Phase.DONE
+            return Action.DONE
+        # ABSENT: 嫌疑独立无害 → 冻结 + 累积 + 重归算续查
+        self._excluded |= unit_jars
+        after = self._reattribute()
+        if not after:
+            # 域尽: 冻结照做(内部排空结案文案被防御结案覆盖),
+            # unfreeze 嫌疑可回 RECHECK 重测(复测排除可撤销)
+            self._manual_freeze(unit_jars, "freeze")
+            self.verdict = Verdict(
+                title="结案: 组合成因未复现(防御)",
+                detail="全部嫌疑已逐个经干净实例排除(不复现), 且剩余"
+                       "域重归算为空 — 本盘面上的组合成因未复现, "
+                       "无法继续定位。\n累计排除: "
+                       + ", ".join(sorted(self._excluded)),
+                culprit=frozenset(self._excluded))
+            self.phase = Phase.DONE
+            return Action.DONE
+        # 续查: 先覆池(嫌疑已被 _excluded 剔出, 冻结不触发
+        # "排空结案"分支)再冻结; 相位恢复收敛前存档再走收敛
+        self._suspect_units = after
+        self._manual_freeze(unit_jars, "freeze")
+        self.phase = self._converged_from
+        return self._enter_next_phase_or_converged()
+
+    def _reattribute(self) -> frozenset[int]:
+        """v0.7 续查重归算原语: 单因公式重放全部历史证据。
+
+        冻结集恒启用后, 共谋问题降维成单因问题(X 恒在场 →
+        问题在场 ⟺ 搭档在场, 精确非近似)。对全量单元域按
+        present → −hit / absent → ∩hit 逐轮重归算, 再剔除
+        frozen/excluded 单元; 卷帘指针不回退(冻结位天然跳过)。
+        过滤: 只认 kind=round 且 plan.phase ∈ {BASELINE, SCAN,
+        BISECT, VERIFY} 的真实作答轮 — OBSTRUCT 探针轮与
+        recheck/显式事件(actual_disabled 空)不参与主域归算。
+        返回续查嫌疑单元索引集; 空池 = 域尽(调用方防御结案)。
+        """
+        domain = {k for k in range(len(self.graph.units))
+                  if self.graph.units[k] & self.universe}
+        for rec in self.history:
+            if rec.kind != "round" or rec.plan is None:
+                continue  # 显式事件/复测轮不参与归算
+            if rec.plan.phase not in (Phase.BASELINE, Phase.SCAN,
+                                      Phase.BISECT, Phase.VERIFY):
+                continue  # OBSTRUCT 探针轮(子流程语义)剔除
+            hit = frozenset(self.graph.unit_of[j]
+                            for j in rec.actual_disabled
+                            if j in self.graph.unit_of)
+            if rec.answer == Answer.PRESENT.value:
+                domain -= hit
+            elif rec.answer == Answer.ABSENT.value:
+                domain &= hit
+        # 剔除冻结(恒启用)与复测排除史单元 — 不再作嫌疑
+        out = {k for k in domain
+               if not (self.graph.units[k] & self._frozen)
+               and not (self.graph.units[k] & self._excluded)}
+        return frozenset(out)
+
     def report(self, answer: Answer,
                actual_disabled: frozenset[str],
                crashed: bool = False) -> Action:
@@ -635,6 +873,16 @@ class BisectEngine:
             self.history.append(RoundRecord(
                 plan=plan, answer="invalid",
                 actual_disabled=frozenset(actual_disabled)))
+            return Action.RETEST_SAME
+
+        # v0.7 决策相位路由: CONVERGED 只收 choose()(三选一);
+        # RECHECK 收 PRESENT/ABSENT 双答(干净实例测试的回报),
+        # 归算转 _report_recheck; 其余答案防御重测(不推进).
+        if self.phase is Phase.CONVERGED:
+            return Action.RETEST_SAME
+        if self.phase is Phase.RECHECK:
+            if answer in (Answer.PRESENT, Answer.ABSENT):
+                return self._report_recheck(answer)
             return Action.RETEST_SAME
 
         # 防御: 跳过仅在基准轮合法(UI 不应在其他轮提供该选项)
@@ -690,7 +938,7 @@ class BisectEngine:
         # PRESENT → 进扫描/二分;SKIP → 信任用户前提直接进
         self.phase = (Phase.SCAN if self.scan_spec is not None
                       else Phase.BISECT)
-        return self._enter_next_phase_or_verify()
+        return self._enter_next_phase_or_converged()
 
     def _report_bisect(self, answer: Answer,
                        actual_disabled: frozenset[str]) -> Action:
@@ -759,7 +1007,7 @@ class BisectEngine:
             self.phase = Phase.DONE
             return Action.DONE
         self._suspect_units = after
-        return self._enter_next_phase_or_verify()
+        return self._enter_next_phase_or_converged()
 
     def _report_scan(self, answer: Answer,
                      actual_disabled: frozenset[str]) -> Action:
@@ -811,7 +1059,7 @@ class BisectEngine:
         self._suspect_units = after
         if locked:
             self.phase = Phase.BISECT  # 锁段: 后续沿用二分收敛
-            return self._enter_next_phase_or_verify()
+            return self._enter_next_phase_or_converged()
         # v0.6: 帘带耗尽而嫌疑未空 → 幸存者必为钉扎成员(_scan_band 永久
         # 跳过它们, 永不进 hit); 空帘带计划会原地重测永不推进 → 收敛结案
         band_next, _ = self._scan_band()
@@ -958,16 +1206,23 @@ class BisectEngine:
                            "重新排查。")
                 self.phase = Phase.DONE
                 return Action.DONE
-            return self._enter_next_phase_or_verify()
+            return self._enter_next_phase_or_converged()
         ob.pool = after
         return Action.NEXT_PLAN
 
     def _report_verify(self, answer: Answer) -> Action:
         unit_jars = self._single_suspect_unit()
         if answer is Answer.PRESENT:
+            # v0.7: 恒启用背景注记 — 本实例最小启用集含冻结/钉启(含
+            # 支撑闭包), 单因判定在此背景下成立(背景贡献不可剥离).
+            bg = sorted(self._frozen | self._pin_on)
+            note = ("。注: 本实例恒启用背景(冻结/钉启): "
+                    + ", ".join(bg) + ", 单因判定含此背景贡献"
+                    if bg else "")
             self.verdict = Verdict(
                 title="确诊: 单一问题 mod",
-                detail="嫌疑 mod 在最小启用集下独立复现问题,确诊为罪魁。\n"
+                detail="嫌疑 mod 在最小启用集下独立复现问题,确诊为罪魁"
+                       + note + "。\n"
                        "建议: 保持该 mod 禁用,还原其余全部 mod,"
                        "再进一次游戏确认问题彻底消失。",
                 culprit=unit_jars)
@@ -982,16 +1237,17 @@ class BisectEngine:
 
     # -------------------------------------------------- 内部工具(私有)
 
-    def _enter_next_phase_or_verify(self) -> Action:
-        """S 收缩后判定是否已收敛到单单元(是则直接进验证轮)。
+    def _enter_next_phase_or_converged(self) -> Action:
+        """S 收缩后判定是否已收敛到单单元(是则转 CONVERGED 三选一)。
 
-        v0.6: 唯一嫌疑处于钉禁(闭包)侧 → 隔离验证无意义(验证轮会禁着
-        嫌疑测, 复现与否都与嫌疑无关) → 守卫结案(收敛证据保留)。
+        v0.7: 验证降级为玩家可选 — 一切收敛(含复测后续查的再收敛)
+        都走三选一; 收敛前相位存档 _converged_from(复测 absent 续查
+        重归算后恢复 SCAN/BISECT)。v0.6 的钉禁守卫移至 choose(VERIFY)
+        前置: 复测导出不看本实例钉扎, stop/recheck 不再被短路剥夺。
         """
         if len(self._suspect_units) == 1:
-            if self._verify_entry_guard():
-                return Action.DONE
-            self.phase = Phase.VERIFY
+            self._converged_from = self.phase
+            self.phase = Phase.CONVERGED
         return Action.NEXT_PLAN
 
     def _single_suspect_unit(self) -> frozenset[str]:
